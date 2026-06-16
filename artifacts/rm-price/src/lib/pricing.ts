@@ -21,7 +21,7 @@ export interface CalcRow {
   prevBase: number | null;
   newBase: number | null;
   prevScrap: number | null;
-  scm14Prev: number | null;
+  newScrap: number | null;
   meltingLoss: number;
   scrapWt: number;
   effectiveScrapWt: number;
@@ -49,32 +49,37 @@ export function effectiveScrapWt(p: Part): number {
 
 function stepCalc(oldPrice: number, p: Part, rm: RmIndex, prevQ: string, newQ: string): CalcRow {
   const prevBase = rm[p.alloy]?.[prevQ] ?? null;
-  const newBase = rm[p.alloy]?.[newQ] ?? null;
+  const newBase  = rm[p.alloy]?.[newQ]  ?? null;
   const prevScrap = rm["SCRAP"]?.[prevQ] ?? null;
-  const scm14Prev = rm["SCM 14"]?.[prevQ] ?? null;
+  const newScrap  = rm["SCRAP"]?.[newQ]  ?? null;
 
   const meltingLoss = +(p.castWt * 1.06).toFixed(4);
   const scrapWt = derivedScrapWt(p);
-  const eScrap = isAsCast(p) ? 0 : scrapWt;
+  const eScrap  = isAsCast(p) ? 0 : scrapWt;
 
   let rmImpact: number | null = null;
-  if (prevBase != null && newBase != null) rmImpact = +((newBase - prevBase) * meltingLoss).toFixed(4);
+  if (prevBase != null && newBase != null) {
+    rmImpact = +((newBase - prevBase) * meltingLoss).toFixed(4);
+  }
 
-  // Scrap deduction: (prevScrap / scm14Prev) × (effectiveScrapWt × 80%)
+  // Scrap deduction = (newScrap − prevScrap) × effectiveScrapWt × 0.8
+  // (change in scrap recovery value; subtracted from new price)
   let scrapDeduction: number | null = 0;
-  if (eScrap > 0 && prevScrap != null && scm14Prev) {
-    scrapDeduction = +((prevScrap / scm14Prev) * (eScrap * 0.8)).toFixed(4);
+  if (eScrap > 0 && prevScrap != null && newScrap != null) {
+    scrapDeduction = +((newScrap - prevScrap) * eScrap * 0.8).toFixed(4);
   }
 
   let newPrice: number | null = null;
-  if (rmImpact != null) newPrice = +(oldPrice + rmImpact - (scrapDeduction ?? 0)).toFixed(2);
+  if (rmImpact != null) {
+    newPrice = +(oldPrice + rmImpact - (scrapDeduction ?? 0)).toFixed(2);
+  }
 
   const missing: string[] = [];
   if (prevBase == null) missing.push(`${p.alloy} ${prevQ}`);
   if (newBase == null) missing.push(`${p.alloy} ${newQ}`);
 
   return {
-    part: p, oldPrice, prevBase, newBase, prevScrap, scm14Prev,
+    part: p, oldPrice, prevBase, newBase, prevScrap, newScrap,
     meltingLoss, scrapWt, effectiveScrapWt: eScrap,
     rmImpact, scrapDeduction, newPrice,
     note: missing.length ? `Missing RM: ${missing.join(", ")}` : undefined,
@@ -97,7 +102,7 @@ export function calcPart(p: Part, rm: RmIndex, prevQ: string, newQ: string, allQ
     const step = stepCalc(oldPrice, p, rm, allQuarters[i - 1], allQuarters[i]);
     if (step.newPrice == null) {
       return { ...step, oldPrice: null, newPrice: null,
-        note: step.note ?? "Cannot chain to selected previous quarter (missing RM)." };
+        note: step.note ?? "Cannot chain (missing RM)." };
     }
     oldPrice = step.newPrice;
   }
@@ -112,7 +117,7 @@ export interface DerivStep {
   fromQ: string; toQ: string;
   oldPrice: number;
   prevBase: number | null; newBase: number | null;
-  prevScrap: number | null; scm14Prev: number | null;
+  prevScrap: number | null; newScrap: number | null;
   meltingLoss: number; scrapWt: number;
   rmImpact: number | null; scrapDeduction: number;
   newPrice: number | null; note?: string;
@@ -128,7 +133,7 @@ export function deriveSeries(p: Part, rm: RmIndex, allQuarters: string[]): Deriv
     out.push({
       fromQ: allQuarters[i - 1], toQ: allQuarters[i],
       oldPrice, prevBase: r.prevBase, newBase: r.newBase,
-      prevScrap: r.prevScrap, scm14Prev: r.scm14Prev,
+      prevScrap: r.prevScrap, newScrap: r.newScrap,
       meltingLoss: r.meltingLoss, scrapWt: r.effectiveScrapWt,
       rmImpact: r.rmImpact, scrapDeduction: r.scrapDeduction ?? 0,
       newPrice: r.newPrice, note: r.note,

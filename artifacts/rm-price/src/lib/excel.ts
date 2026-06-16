@@ -4,6 +4,8 @@ import {
   type CalcRow, type Part, type RmIndex, endsIn0or6,
 } from "./pricing";
 
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
 function saveBlob(filename: string, data: unknown) {
   let ab: ArrayBuffer;
   if (data instanceof ArrayBuffer) ab = data;
@@ -35,6 +37,289 @@ function sortKey(p: Pick<Part,"poNum"|"plant"|"partNumber">) {
   return `${p.poNum ?? ""}|${p.plant ?? ""}|${p.partNumber ?? ""}`;
 }
 
+// Column letter(s) from 0-based index
+function colLetter(idx: number): string {
+  let s = "";
+  let n = idx;
+  while (n >= 0) {
+    s = String.fromCharCode((n % 26) + 65) + s;
+    n = Math.floor(n / 26) - 1;
+  }
+  return s;
+}
+
+// Build a cell address string
+function addr(col: number, row: number) { return `${colLetter(col)}${row}`; }
+
+// ─── Cell builder helpers ─────────────────────────────────────────────────────
+
+type XlsxCell = { v?: string | number | null; t?: string; f?: string; z?: string };
+
+function strCell(v: string): XlsxCell { return { v, t: "s" }; }
+function numCell(v: number | null | undefined): XlsxCell {
+  if (v == null || Number.isNaN(v)) return { v: "", t: "s" };
+  return { v, t: "n" };
+}
+function formulaCell(f: string, cached?: number | null): XlsxCell {
+  // xlsx writes formula without leading "=" — we strip it if present
+  const fstr = f.startsWith("=") ? f.slice(1) : f;
+  if (cached != null && !Number.isNaN(cached)) return { f: fstr, v: cached, t: "n" };
+  return { f: fstr, t: "n" };
+}
+function pctCell(f: string, cached?: number | null): XlsxCell {
+  const cell = formulaCell(f, cached);
+  return { ...cell, z: "0.00%" };
+}
+
+/** Write an array of XLSX cells to a worksheet at the given row (1-indexed) */
+function writeRow(ws: Record<string, XlsxCell | unknown>, rowIdx: number, cells: XlsxCell[]) {
+  for (let c = 0; c < cells.length; c++) {
+    ws[addr(c, rowIdx)] = cells[c];
+  }
+}
+
+/** Set worksheet range !ref */
+function setRef(ws: Record<string, unknown>, maxCol: number, maxRow: number) {
+  ws["!ref"] = `A1:${colLetter(maxCol - 1)}${maxRow}`;
+}
+
+/** Set column widths */
+function setCols(ws: Record<string, unknown>, widths: number[]) {
+  ws["!cols"] = widths.map((w) => ({ wch: w }));
+}
+
+// ─── RM Index sheet ───────────────────────────────────────────────────────────
+
+function buildRmSheet(rm: RmIndex, alloys: string[], quarters: string[]): Record<string, unknown> {
+  const ws: Record<string, unknown> = {};
+  const allRows = [...alloys, "SCRAP"];
+  // Header row: col 0 = "Alloy / Grade", then quarters
+  writeRow(ws, 1, [strCell("Alloy / Grade"), ...quarters.map(strCell)]);
+  for (let r = 0; r < allRows.length; r++) {
+    const a = allRows[r];
+    writeRow(ws, r + 2, [
+      strCell(a),
+      ...quarters.map((q) => numCell(rm[a]?.[q] ?? null)),
+    ]);
+  }
+  setRef(ws, quarters.length + 1, allRows.length + 1);
+  setCols(ws, [18, ...quarters.map(() => 14)]);
+  return ws;
+}
+
+// ─── Calculated Prices sheet with formulas ───────────────────────────────────
+
+/**
+ * Column layout (0-indexed):
+ *  A=0  CC (formula)
+ *  B=1  PO Num
+ *  C=2  Vendor Code
+ *  D=3  Part #
+ *  E=4  Description
+ *  F=5  Plant
+ *  G=6  Alloy
+ *  H=7  Cast Wt
+ *  I=8  Mach Wt
+ *  J=9  Scrap Wt        =MAX(H-I,0)
+ *  K=10 AS CAST (Y/N)
+ *  L=11 Old Price       (input)
+ *  M=12 Prev RM Base    VLOOKUP → RM Index
+ *  N=13 New RM Base     VLOOKUP → RM Index
+ *  O=14 Melt Loss       =H*1.06
+ *  P=15 Eff Scrap Wt    =IF(K="Y",0,J)
+ *  Q=16 Prev Scrap Rate VLOOKUP "SCRAP" → RM Index
+ *  R=17 New Scrap Rate  VLOOKUP "SCRAP" → RM Index
+ *  S=18 RM Impact       =(N-M)*O
+ *  T=19 Scrap Ded       =(R-Q)*P*0.8
+ *  U=20 New Price       =L+S-T
+ *  V=21 Δ ₹             =U-L
+ *  W=22 Δ %             =(U-L)/L
+ *  X=23 Δ Lakhs         =(U-L)*GRN Qty (if provided, else blank)
+ *  Y=24 Note            (static)
+ */
+const CAL_HEADERS = [
+  "CC","PO Num","Vendor Code","Part #","Description","Plant","Alloy",
+  "Cast Wt","Mach Wt",
+  "Scrap Wt\n=MAX(Cast-Mach,0)",
+  "AS CAST",
+  `Old Price`,
+  "Prev RM Base\n(VLOOKUP)",
+  "New RM Base\n(VLOOKUP)",
+  "Melt Loss\n=Cast×1.06",
+  "Eff Scrap Wt\n=IF(AS CAST,0,Scrap Wt)",
+  "Prev Scrap Rate\n(VLOOKUP)",
+  "New Scrap Rate\n(VLOOKUP)",
+  "RM Impact\n=(New RM−Prev RM)×Melt Loss",
+  "Scrap Ded\n=(New Scrap−Prev Scrap)×Eff Scrap×0.8",
+  "New Price\n=Old+RM Impact−Scrap Ded",
+  "Δ ₹\n=New−Old",
+  "Δ %\n=(New−Old)/Old",
+  "Note",
+];
+
+function buildCalcSheet(
+  rows: CalcRow[],
+  grnQty: Record<string, number>,
+  rmSheetName: string,
+  alloys: string[],
+  quarters: string[],
+  prevQ: string,
+  newQ: string,
+): Record<string, unknown> {
+  const ws: Record<string, unknown> = {};
+
+  // Freeze first row + first 4 cols
+  ws["!freeze"] = { xSplit: 4, ySplit: 1 };
+
+  // Find column indices for prevQ and newQ in RM Index sheet (1-based for VLOOKUP)
+  const allRmRows = [...alloys, "SCRAP"];
+  // In RM Index sheet: col A = alloy name (col 1 in VLOOKUP), col B = Q[0] (col 2), ...
+  const prevQColIdx = quarters.indexOf(prevQ) + 2; // 2 = 1-based offset after alloy col
+  const newQColIdx  = quarters.indexOf(newQ)  + 2;
+  const rmTotalCols = quarters.length + 1; // alloy col + quarter cols
+
+  const rmRef = `'${rmSheetName}'!$A:${colLetter(rmTotalCols - 1)}`;
+  const rmRow1 = `'${rmSheetName}'!$1:$1`; // header row for MATCH
+
+  // Helper: VLOOKUP for a given alloy ref cell and column index
+  const vlookupAlloy = (alloyCellAddr: string, qColIdx: number) =>
+    `IFERROR(VLOOKUP(${alloyCellAddr},${rmRef},${qColIdx},0),"")`;
+
+  // Header row
+  writeRow(ws, 1, CAL_HEADERS.map(strCell));
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const rowIdx = i + 2; // 1-based, row 1 = header
+    const R = rowIdx; // shorthand
+
+    // Column letters for this row
+    const H = `H${R}`, I = `I${R}`, J = `J${R}`, K = `K${R}`;
+    const L = `L${R}`, M = `M${R}`, N = `N${R}`, O = `O${R}`;
+    const P = `P${R}`, Q = `Q${R}`, Rcell = `R${R}`;
+    const S = `S${R}`, T = `T${R}`, U = `U${R}`;
+    const G = `G${R}`;
+
+    // A: CC = plant & part number
+    const ccVal = cc(r.part);
+    writeRow(ws, R, [
+      formulaCell(`F${R}&D${R}`, undefined),                          // A: CC
+      strCell(r.part.poNum ?? ""),                                    // B: PO Num
+      strCell(r.part.vendorCode ?? ""),                               // C: Vendor Code
+      strCell(r.part.partNumber),                                     // D: Part #
+      strCell(r.part.description),                                    // E: Description
+      strCell(r.part.plant),                                          // F: Plant
+      strCell(r.part.alloy),                                          // G: Alloy
+      numCell(r.part.castWt),                                         // H: Cast Wt
+      numCell(r.part.machiningWt),                                    // I: Mach Wt
+      formulaCell(`MAX(${H}-${I},0)`, r.scrapWt),                    // J: Scrap Wt
+      strCell(r.part.asCast ? "Y" : "N"),                            // K: AS CAST
+      numCell(r.oldPrice),                                            // L: Old Price
+      formulaCell(vlookupAlloy(G, prevQColIdx), r.prevBase ?? undefined), // M: Prev RM
+      formulaCell(vlookupAlloy(G, newQColIdx),  r.newBase  ?? undefined), // N: New RM
+      formulaCell(`${H}*1.06`, r.meltingLoss),                       // O: Melt Loss
+      formulaCell(`IF(${K}="Y",0,${J})`, r.effectiveScrapWt),        // P: Eff Scrap Wt
+      formulaCell(vlookupAlloy('"SCRAP"', prevQColIdx), r.prevScrap ?? undefined), // Q: Prev Scrap
+      formulaCell(vlookupAlloy('"SCRAP"', newQColIdx),  r.newScrap  ?? undefined), // R: New Scrap
+      formulaCell(`IF(AND(ISNUMBER(${M}),ISNUMBER(${N})),(${N}-${M})*${O},"")`, r.rmImpact ?? undefined), // S: RM Impact
+      formulaCell(`IF(AND(ISNUMBER(${Q}),ISNUMBER(${Rcell}),${P}>0),(${Rcell}-${Q})*${P}*0.8,0)`, r.scrapDeduction ?? 0), // T: Scrap Ded
+      formulaCell(`IF(ISNUMBER(${S}),${L}+${S}-${T},"")`, r.newPrice ?? undefined), // U: New Price
+      formulaCell(`IF(ISNUMBER(${U}),${U}-${L},"")`, r.newPrice != null && r.oldPrice != null ? r.newPrice - r.oldPrice : undefined), // V: Δ₹
+      pctCell(`IF(AND(ISNUMBER(${U}),${L}>0),(${U}-${L})/${L},"")`,
+        r.newPrice != null && r.oldPrice ? (r.newPrice - r.oldPrice) / r.oldPrice : undefined), // W: Δ%
+      strCell(r.note ?? ""),                                          // X: Note
+    ]);
+  }
+
+  const totalRows = rows.length + 1;
+  setRef(ws, CAL_HEADERS.length, totalRows);
+  setCols(ws, [
+    14,  // CC
+    10,  // PO
+    12,  // Vendor
+    14,  // Part#
+    28,  // Desc
+    8,   // Plant
+    12,  // Alloy
+    9,   // CastWt
+    9,   // MachWt
+    10,  // ScrapWt
+    9,   // AsCast
+    11,  // OldPrice
+    12,  // PrevRM
+    12,  // NewRM
+    12,  // MeltLoss
+    14,  // EffScrap
+    14,  // PrevScrap
+    14,  // NewScrap
+    14,  // RMImpact
+    16,  // ScrapDed
+    12,  // NewPrice
+    10,  // Δ₹
+    8,   // Δ%
+    20,  // Note
+  ]);
+
+  return ws;
+}
+
+// ─── GRN Impact sheet with formulas ──────────────────────────────────────────
+
+/**
+ * GRN Impact columns:
+ *  A Vendor | B PO | C Plant | D Part# | E Desc | F Alloy
+ *  G Old Price | H New Price (=from Calc sheet, or static) | I Δ₹ =H-G
+ *  J GRN Qty (user input — left blank for user to fill if not provided)
+ *  K Impact (₹) =IF(ISNUMBER(J),(H-G)*J,"")
+ *  L Impact (Lakhs) =IF(ISNUMBER(K),K/100000,"")
+ */
+const GRN_HEADERS = [
+  "Vendor Code","PO Num","Plant","Part #","Description","Alloy",
+  "Old Price","New Price","Δ ₹\n=New−Old",
+  "GRN Qty\n(enter here)",
+  "Impact (₹)\n=(New−Old)×GRN Qty",
+  "Impact (₹ Lakhs)\n=Impact÷1,00,000",
+];
+
+function buildGrnSheet(rows: CalcRow[], grnQty: Record<string, number>): Record<string, unknown> {
+  const ws: Record<string, unknown> = {};
+  writeRow(ws, 1, GRN_HEADERS.map(strCell));
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const rowIdx = i + 2;
+    const R = rowIdx;
+    const G = `G${R}`, H = `H${R}`, J = `J${R}`, K = `K${R}`;
+    const qty = grnQty[r.part.id] ?? null;
+    const delta = r.oldPrice != null && r.newPrice != null ? r.newPrice - r.oldPrice : null;
+    const impact = delta != null && qty ? delta * qty : null;
+
+    writeRow(ws, R, [
+      strCell(r.part.vendorCode ?? ""),                                       // A Vendor
+      strCell(r.part.poNum ?? ""),                                            // B PO
+      strCell(r.part.plant),                                                  // C Plant
+      strCell(r.part.partNumber),                                             // D Part#
+      strCell(r.part.description),                                            // E Desc
+      strCell(r.part.alloy),                                                  // F Alloy
+      numCell(r.oldPrice),                                                    // G Old Price
+      numCell(r.newPrice),                                                    // H New Price
+      formulaCell(`IF(AND(ISNUMBER(${G}),ISNUMBER(${H})),${H}-${G},"")`, delta ?? undefined), // I Δ₹
+      qty ? numCell(qty) : strCell(""),                                       // J GRN Qty
+      formulaCell(`IF(ISNUMBER(${J}),(${H}-${G})*${J},"")`,
+        impact ?? undefined),                                                 // K Impact ₹
+      formulaCell(`IF(ISNUMBER(${K}),${K}/100000,"")`,
+        impact != null ? impact / 100000 : undefined),                       // L Lakhs
+    ]);
+  }
+
+  const totalRows = rows.length + 1;
+  setRef(ws, GRN_HEADERS.length, totalRows);
+  setCols(ws, [12,10,8,14,28,12,11,11,10,12,16,16]);
+  return ws;
+}
+
+// ─── Public export functions ──────────────────────────────────────────────────
+
 export const PART_HEADERS = [
   "PartNo","Description","Plant","VendorCode","PoNum","Alloy",
   "CastWt","MachiningWt","AsCast(Y/N)","BasePrice","BaseQuarter",
@@ -52,9 +337,9 @@ export function downloadPartsTemplate() {
 
 export function downloadPartsExport(parts: Part[]) {
   const wb = XLSX.utils.book_new();
-  const all = parts
-    .slice()
-    .sort((a,b) => (vKey(a.vendorCode)).localeCompare(vKey(b.vendorCode)) || sortKey(a).localeCompare(sortKey(b)));
+  const all = parts.slice().sort((a,b) =>
+    vKey(a.vendorCode).localeCompare(vKey(b.vendorCode)) || sortKey(a).localeCompare(sortKey(b))
+  );
   const allRows = all.map((p) => [
     p.partNumber, p.description, p.plant, p.vendorCode ?? "", p.poNum ?? "", p.alloy,
     p.castWt, p.machiningWt, p.asCast ? "Y" : "N", p.basePrice, p.baseQuarter,
@@ -187,8 +472,11 @@ export function downloadCalcExport(
   header: { amendmentReason: string },
   quarters: string[],
   alloys: string[],
+  grnQty: Record<string, number> = {},
 ) {
   const wb = XLSX.utils.book_new();
+
+  // Sheet 1: Cover
   const cover = XLSX.utils.aoa_to_sheet([
     ["AMENDMENT — Quarterly Price Recompute"],
     [],
@@ -197,98 +485,53 @@ export function downloadCalcExport(
     ["To Quarter", newQ],
     ["Parts in scope", parts.length],
     ["Generated", new Date().toISOString()],
+    [],
+    ["FORMULA REFERENCE"],
+    ["Melt Loss",            "= Cast Wt × 1.06"],
+    ["Scrap Wt",             "= MAX(Cast Wt − Mach Wt, 0)"],
+    ["Eff Scrap Wt",         "= IF(AS CAST = Y, 0, Scrap Wt)"],
+    ["RM Impact",            "= (New RM Base − Prev RM Base) × Melt Loss"],
+    ["Scrap Deduction",      "= (New Scrap Rate − Prev Scrap Rate) × Eff Scrap Wt × 0.8"],
+    ["New Price",            "= Old Price + RM Impact − Scrap Deduction"],
+    ["New Scrap Rate (auto)","= (Old Scrap Rate ÷ Old SCM14 Rate) × New SCM14 Rate"],
   ]);
   XLSX.utils.book_append_sheet(wb, cover, "Amendment");
 
-  const calcHeader = [
-    "CC","PO Num","Vendor Code","Part #","Description","Plant","Alloy",
-    "Cast Wt","Mach Wt","Scrap Wt","AS CAST",
-    `Old Price (${prevQ})`,"Prev RM","New RM","Melting Loss",
-    "Eff Scrap Wt","Prev Scrap","SCM14 Prev","RM Impact","Scrap Deduction",
-    `New Price (${newQ})`,"Δ ₹","Δ %","Note",
-  ];
-  const calcRow = (r: CalcRow) => {
-    const old = r.oldPrice ?? null;
-    const delta = old != null && r.newPrice != null ? +(r.newPrice - old).toFixed(2) : null;
-    const pct = old && r.newPrice != null ? +(((r.newPrice - old) / old) * 100).toFixed(2) : null;
-    return [
-      cc(r.part), r.part.poNum ?? "", r.part.vendorCode ?? "",
-      r.part.partNumber, r.part.description, r.part.plant, r.part.alloy,
-      r.part.castWt, r.part.machiningWt, r.scrapWt, r.part.asCast ? "Y" : "N",
-      old, r.prevBase, r.newBase, r.meltingLoss,
-      r.effectiveScrapWt, r.prevScrap, r.scm14Prev, r.rmImpact, r.scrapDeduction,
-      r.newPrice, delta, pct, r.note ?? "",
-    ];
-  };
-  XLSX.utils.book_append_sheet(wb,
-    XLSX.utils.aoa_to_sheet([calcHeader, ...rows.map(calcRow)]),
-    "Calculated Prices");
+  // Sheet 2: RM Index (used by VLOOKUP formulas in Calculated Prices)
+  const RM_SHEET = "RM Index";
+  const rmSheet = buildRmSheet(rm, alloys, quarters);
+  XLSX.utils.book_append_sheet(wb, rmSheet as XLSX.WorkSheet, RM_SHEET);
 
-  const rowsByVendor = new Map<string, CalcRow[]>();
-  for (const r of rows) {
+  // Sort rows same as display (by vendor, then part)
+  const sortedRows = rows.slice().sort((a, b) =>
+    vKey(a.part.vendorCode).localeCompare(vKey(b.part.vendorCode)) ||
+    sortKey(a.part).localeCompare(sortKey(b.part))
+  );
+
+  // Sheet 3: All Vendors — Calculated Prices with formulas
+  const calcSheet = buildCalcSheet(sortedRows, grnQty, RM_SHEET, alloys, quarters, prevQ, newQ);
+  XLSX.utils.book_append_sheet(wb, calcSheet as XLSX.WorkSheet, "Calculated Prices");
+
+  // Per-vendor calc sheets
+  const byVendor = new Map<string, CalcRow[]>();
+  for (const r of sortedRows) {
     const k = vKey(r.part.vendorCode);
-    const arr = rowsByVendor.get(k) ?? []; arr.push(r); rowsByVendor.set(k, arr);
+    const arr = byVendor.get(k) ?? []; arr.push(r); byVendor.set(k, arr);
   }
-  for (const [vendor, vrows] of [...rowsByVendor.entries()].sort(([a],[b])=>a.localeCompare(b))) {
-    XLSX.utils.book_append_sheet(wb,
-      XLSX.utils.aoa_to_sheet([calcHeader, ...vrows.map(calcRow)]),
-      sanitizeSheet(`Calc_${vendor}`));
+  for (const [vendor, vrows] of [...byVendor.entries()].sort(([a],[b])=>a.localeCompare(b))) {
+    const vs = buildCalcSheet(vrows, grnQty, RM_SHEET, alloys, quarters, prevQ, newQ);
+    XLSX.utils.book_append_sheet(wb, vs as XLSX.WorkSheet, sanitizeSheet(`Calc_${vendor}`));
   }
 
-  // RM Index snapshot
-  const rmAlloys = [...alloys, "SCRAP"];
-  const rmHeader = ["Alloy / Grade", ...quarters];
-  const rmBody = rmAlloys.map((a) => [a, ...quarters.map((q) => rm[a]?.[q] ?? "")]);
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([rmHeader, ...rmBody]), "RM Index");
+  // Sheet: GRN Impact with formulas
+  const grnSheet = buildGrnSheet(sortedRows, grnQty);
+  XLSX.utils.book_append_sheet(wb, grnSheet as XLSX.WorkSheet, "GRN Impact");
 
   const file = `price-calc-${prevQ}-to-${newQ}.xlsx`.replace(/'/g, "");
-  saveBlob(file, XLSX.write(wb, { type: "array", bookType: "xlsx" }));
+  saveBlob(file, XLSX.write(wb, { type: "array", bookType: "xlsx", cellStyles: true }));
 }
 
-export const GRN_HEADERS = [
-  "Vendor Code","PO Num","Plant","Part Number","Description","Alloy",
-  "Old Price","New Price","Δ ₹","GRN Qty","Impact (Δ × GRN)","Impact (₹ Lakhs)",
-] as const;
-
-export function downloadGrnTemplate(
-  parts: Part[], rows: CalcRow[], grnQty: Record<string, number>,
-  prevQ: string, newQ: string,
-) {
-  const wb = XLSX.utils.book_new();
-  const byId = new Map(rows.map((r) => [r.part.id, r]));
-  const buildRows = (items: Part[]) => items.map((p) => {
-    const r = byId.get(p.id);
-    const old = r?.oldPrice ?? null;
-    const np = r?.newPrice ?? null;
-    const delta = old != null && np != null ? +(np - old).toFixed(2) : "";
-    const qty = grnQty[p.id] ?? "";
-    const impact = (typeof delta === "number" && typeof qty === "number")
-      ? +(delta * qty).toFixed(2) : "";
-    const impactLakh = typeof impact === "number" ? +(impact / 100000).toFixed(4) : "";
-    return [
-      p.vendorCode ?? "", p.poNum ?? "", p.plant, p.partNumber, p.description, p.alloy,
-      old ?? "", np ?? "", delta, qty, impact, impactLakh,
-    ];
-  });
-  const sortedAll = parts.slice().sort((a,b) =>
-    vKey(a.vendorCode).localeCompare(vKey(b.vendorCode)) || sortKey(a).localeCompare(sortKey(b))
-  );
-  XLSX.utils.book_append_sheet(wb,
-    XLSX.utils.aoa_to_sheet([
-      [`GRN Impact — fill column "GRN Qty". Prices = ${prevQ} → ${newQ}.`],
-      [...GRN_HEADERS], ...buildRows(sortedAll),
-    ]), "All Vendors");
-  for (const [vendor, items] of groupByVendor(parts)) {
-    const sorted = items.slice().sort((a,b)=> sortKey(a).localeCompare(sortKey(b)));
-    XLSX.utils.book_append_sheet(wb,
-      XLSX.utils.aoa_to_sheet([[...GRN_HEADERS], ...buildRows(sorted)]),
-      sanitizeSheet(`V_${vendor}`));
-  }
-  saveBlob(`grn-impact-${prevQ}-to-${newQ}.xlsx`.replace(/'/g,""),
-    XLSX.write(wb, { type: "array", bookType: "xlsx" }));
-}
-
-export const GRN_QTY_COL = 9; // 0-indexed column for GRN Qty in template
+export const GRN_QTY_COL = 9;
 export function grnKey(p: Part) { return `${p.vendorCode ?? ""}|${p.poNum ?? ""}|${p.plant}|${p.partNumber}`; }
 
 export async function parseGrnExcel(file: File): Promise<Record<string, number>> {
@@ -297,7 +540,6 @@ export async function parseGrnExcel(file: File): Promise<Record<string, number>>
   const ws = wb.Sheets[wb.SheetNames[0]];
   const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" });
   const out: Record<string, number> = {};
-  // Find header row
   let hdr = 0;
   for (let i = 0; i < Math.min(aoa.length, 5); i++) {
     const row = aoa[i] as string[];
@@ -321,6 +563,33 @@ export async function parseGrnExcel(file: File): Promise<Record<string, number>>
 }
 
 export function quickScrapWt(p: Part) { return derivedScrapWt(p); }
-
-// Alias for usage in vendor derivation export
 export { deriveSeries };
+
+export function downloadGrnTemplate(
+  parts: Part[], rows: CalcRow[], grnQty: Record<string, number>,
+  prevQ: string, newQ: string,
+) {
+  const wb = XLSX.utils.book_new();
+
+  const sortedRows = rows.slice().sort((a, b) =>
+    vKey(a.part.vendorCode).localeCompare(vKey(b.part.vendorCode)) ||
+    sortKey(a.part).localeCompare(sortKey(b.part))
+  );
+
+  const grnSheet = buildGrnSheet(sortedRows, grnQty);
+  XLSX.utils.book_append_sheet(wb, grnSheet as XLSX.WorkSheet, "GRN Impact");
+
+  // Per-vendor sheets
+  const byVendor = new Map<string, CalcRow[]>();
+  for (const r of sortedRows) {
+    const k = vKey(r.part.vendorCode);
+    const arr = byVendor.get(k) ?? []; arr.push(r); byVendor.set(k, arr);
+  }
+  for (const [vendor, vrows] of [...byVendor.entries()].sort(([a],[b])=>a.localeCompare(b))) {
+    const vs = buildGrnSheet(vrows, grnQty);
+    XLSX.utils.book_append_sheet(wb, vs as XLSX.WorkSheet, sanitizeSheet(`V_${vendor}`));
+  }
+
+  saveBlob(`grn-impact-${prevQ}-to-${newQ}.xlsx`.replace(/'/g,""),
+    XLSX.write(wb, { type: "array", bookType: "xlsx" }));
+}
