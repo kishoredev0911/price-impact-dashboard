@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "RM Price Calculator"
+version = "1.0.0"
+id = "artifacts/rm-price"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24021
+
+[services.development]
+run = "pnpm --filter @workspace/rm-price run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/rm-price", "run", "build" ]
+publicDir = "artifacts/rm-price/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24021"
+BASE_PATH = "/"
