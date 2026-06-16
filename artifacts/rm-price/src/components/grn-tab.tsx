@@ -102,11 +102,11 @@ export function GrnTab({
           </div>
           <div className="flex gap-2 flex-wrap">
             <Button size="sm" variant="outline"
-              onClick={() => downloadGrnTemplate(parts, rows, grnQty, prevQ, newQ)}>
+              onClick={async () => downloadGrnTemplate(parts, rows, grnQty, prevQ, newQ)}>
               <FileSpreadsheet className="size-4 mr-1.5" />Template
             </Button>
             <Button size="sm" variant="outline"
-              onClick={() => downloadGrnTemplate(parts, rows, grnQty, prevQ, newQ)}>
+              onClick={async () => downloadGrnTemplate(parts, rows, grnQty, prevQ, newQ)}>
               <Download className="size-4 mr-1.5" />Export
             </Button>
             <Button size="sm" variant="outline" onClick={() => fileRef.current?.click()}>

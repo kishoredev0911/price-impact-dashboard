@@ -297,7 +297,7 @@ export default function Home() {
             </div>
             <div className="space-y-1.5">
               <Label>Export</Label>
-              <Button className="w-full" onClick={() =>
+              <Button className="w-full" onClick={async () =>
                 downloadCalcExport(parts, effectiveRows, displayRm, prevQ, newQ, { amendmentReason }, quarters, alloys, grnQty)
               }>
                 <Download className="size-4 mr-1.5" />Export Calculation Excel
@@ -357,7 +357,7 @@ export default function Home() {
                     New Price = Old Price + RM Impact − Scrap Deduction. Scrap Ded = (New Scrap Rate − Prev Scrap Rate) × Eff Scrap Wt × 0.8
                   </CardDescription>
                 </div>
-                <Button onClick={() => downloadCalcExport(parts, effectiveRows, displayRm, prevQ, newQ, { amendmentReason }, quarters, alloys, grnQty)} size="sm">
+                <Button onClick={async () => downloadCalcExport(parts, effectiveRows, displayRm, prevQ, newQ, { amendmentReason }, quarters, alloys, grnQty)} size="sm">
                   <Download className="size-4 mr-1.5" />Export Excel
                 </Button>
               </CardHeader>
