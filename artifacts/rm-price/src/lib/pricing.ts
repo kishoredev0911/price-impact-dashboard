@@ -13,6 +13,7 @@ export interface Part {
   basePrice: number;
   baseQuarter: string;
   poNum?: string;
+  grnQty?: number;
 }
 
 export interface CalcRow {

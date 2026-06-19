@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, useEffect } from "react";
 import {
   calcAll, cc, computeHistory, deriveSeries, derivedScrapWt,
   findInconsistencies, inconsistentIds, isManualAsCast, computeAutoScrap,
   type Part, type RmIndex,
 } from "@/lib/pricing";
+import { supabase } from "@/lib/supabase";
 import {
   downloadCalcExport, downloadHistoryExport, downloadPartsExport, downloadPartsTemplate,
   downloadRmTemplate, parsePartsExcel, parseRmExcel,
@@ -46,13 +47,14 @@ function signColor(n: number | null | undefined): string {
 }
 
 export default function Home() {
-  // Quarter & alloy config (user-editable)
-  const [quarters, setQuarters] = useState<string[]>(DEFAULT_QUARTERS);
-  const [alloys, setAlloys] = useState<string[]>(DEFAULT_ALLOYS);
+  const isSupabaseConfigured = Boolean(
+    import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY
+  );
 
-  const RM_ROWS = useMemo(() => [...alloys, "SCRAP"], [alloys]);
-
-  const [rm, setRm] = useState<RmIndex>(() => {
+  // Fallback states for Sandbox Mode
+  const [quartersRaw, setQuartersRaw] = useState<string[]>(DEFAULT_QUARTERS);
+  const [alloysRaw, setAlloysRaw] = useState<string[]>(DEFAULT_ALLOYS);
+  const [rmRaw, setRmRaw] = useState<RmIndex>(() => {
     const init: RmIndex = {};
     for (const a of [...DEFAULT_ALLOYS, "SCRAP"]) {
       init[a] = {};
@@ -62,14 +64,378 @@ export default function Home() {
     }
     return init;
   });
-  const [parts, setParts] = useState<Part[]>(SEED_PARTS);
-  const [prevQ, setPrevQ] = useState<string>(DEFAULT_QUARTERS[0]);
-  const [newQ, setNewQ] = useState<string>(DEFAULT_QUARTERS[1] ?? DEFAULT_QUARTERS[0]);
-  const [amendmentReason, setAmendmentReason] = useState("");
-  const [grnQty, setGrnQty] = useState<Record<string, number>>({});
+  const [partsRaw, setPartsRaw] = useState<Part[]>(SEED_PARTS);
+  const [prevQRaw, setPrevQRaw] = useState<string>(DEFAULT_QUARTERS[0]);
+  const [newQRaw, setNewQRaw] = useState<string>(DEFAULT_QUARTERS[1] ?? DEFAULT_QUARTERS[0]);
+  const [amendmentReasonRaw, setAmendmentReasonRaw] = useState("");
+  const [scrapOverrideRaw, setScrapOverrideRaw] = useState<Record<string, boolean>>({});
 
-  // SCRAP auto-compute override: track which (alloy=SCRAP, quarter) cells the user has manually set
-  const [scrapOverride, setScrapOverride] = useState<Record<string, boolean>>({});
+  // DB Sync states
+  const [loading, setLoading] = useState(isSupabaseConfigured);
+  const [dbError, setDbError] = useState<string | null>(null);
+
+  const [quartersDb, setQuartersDb] = useState<string[]>([]);
+  const [alloysDb, setAlloysDb] = useState<string[]>([]);
+  const [rmDb, setRmDb] = useState<RmIndex>({});
+  const [partsDb, setPartsDb] = useState<Part[]>([]);
+  const [prevQDb, setPrevQDb] = useState<string>("");
+  const [newQDb, setNewQDb] = useState<string>("");
+  const [amendmentReasonDb, setAmendmentReasonDb] = useState("");
+  const [scrapOverrideDb, setScrapOverrideDb] = useState<Record<string, boolean>>({});
+
+  // Unified getters
+  const quarters = isSupabaseConfigured ? quartersDb : quartersRaw;
+  const alloys = isSupabaseConfigured ? alloysDb : alloysRaw;
+  const rm = isSupabaseConfigured ? rmDb : rmRaw;
+  const parts = isSupabaseConfigured ? partsDb : partsRaw;
+  const prevQ = isSupabaseConfigured ? prevQDb : prevQRaw;
+  const newQ = isSupabaseConfigured ? newQDb : newQRaw;
+  const amendmentReason = isSupabaseConfigured ? amendmentReasonDb : amendmentReasonRaw;
+  const scrapOverride = isSupabaseConfigured ? scrapOverrideDb : scrapOverrideRaw;
+
+  // Unified setters
+  const setQuarters = isSupabaseConfigured ? setQuartersDb : setQuartersRaw;
+  const setAlloys = isSupabaseConfigured ? setAlloysDb : setAlloysRaw;
+  const setRm = isSupabaseConfigured ? setRmDb : setRmRaw;
+  const setParts = isSupabaseConfigured ? setPartsDb : setPartsRaw;
+  const setPrevQ = isSupabaseConfigured ? setPrevQDb : setPrevQRaw;
+  const setNewQ = isSupabaseConfigured ? setNewQDb : setNewQRaw;
+  const setAmendmentReason = isSupabaseConfigured ? setAmendmentReasonDb : setAmendmentReasonRaw;
+  const setScrapOverride = isSupabaseConfigured ? setScrapOverrideDb : setScrapOverrideRaw;
+
+  const RM_ROWS = useMemo(() => [...alloys, "SCRAP"], [alloys]);
+
+  // Load from Supabase on mount
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    let active = true;
+
+    async function loadData() {
+      try {
+        setLoading(true);
+        // 1. Fetch settings
+        let { data: settingsData, error: settingsErr } = await supabase
+          .from("settings")
+          .select("*")
+          .eq("id", 1)
+          .single();
+
+        if (settingsErr && settingsErr.code === "PGRST116") {
+          const defaultSettings = {
+            id: 1,
+            quarters: DEFAULT_QUARTERS,
+            alloys: DEFAULT_ALLOYS,
+            prev_q: DEFAULT_QUARTERS[0],
+            new_q: DEFAULT_QUARTERS[1] ?? DEFAULT_QUARTERS[0],
+            amendment_reason: "",
+            scrap_override: {},
+          };
+          const { data: inserted, error: insertErr } = await supabase
+            .from("settings")
+            .insert(defaultSettings)
+            .select()
+            .single();
+
+          if (insertErr) throw insertErr;
+          settingsData = inserted;
+        } else if (settingsErr) {
+          throw settingsErr;
+        }
+
+        // 2. Fetch parts
+        let { data: partsData, error: partsErr } = await supabase
+          .from("parts")
+          .select("*")
+          .order("created_at", { ascending: true });
+
+        if (partsErr) throw partsErr;
+
+        if (!partsData || partsData.length === 0) {
+          const { data: seededParts, error: seedPartsErr } = await supabase
+            .from("parts")
+            .insert(SEED_PARTS.map(p => ({
+              id: p.id,
+              part_number: p.partNumber,
+              description: p.description,
+              plant: p.plant,
+              vendor_code: p.vendorCode || null,
+              alloy: p.alloy,
+              cast_wt: p.castWt,
+              machining_wt: p.machiningWt,
+              as_cast: p.asCast,
+              base_price: p.basePrice,
+              base_quarter: p.baseQuarter,
+              po_num: p.poNum || null,
+              grn_qty: p.grnQty ?? 0,
+            })))
+            .select();
+
+          if (seedPartsErr) throw seedPartsErr;
+          partsData = seededParts;
+        }
+
+        // 3. Fetch RM index
+        let { data: rmData, error: rmErr } = await supabase
+          .from("rm_index")
+          .select("*");
+
+        if (rmErr) throw rmErr;
+
+        if (!rmData || rmData.length === 0) {
+          const toInsert: any[] = [];
+          for (const alloy of Object.keys(SEED_RM_INDEX)) {
+            for (const quarter of Object.keys(SEED_RM_INDEX[alloy])) {
+              toInsert.push({
+                alloy,
+                quarter,
+                value: SEED_RM_INDEX[alloy][quarter],
+              });
+            }
+          }
+          const { data: seededRm, error: seedRmErr } = await supabase
+            .from("rm_index")
+            .insert(toInsert)
+            .select();
+
+          if (seedRmErr) throw seedRmErr;
+          rmData = seededRm;
+        }
+
+        if (!active) return;
+
+        setQuartersDb(settingsData.quarters);
+        setAlloysDb(settingsData.alloys);
+        setPrevQDb(settingsData.prev_q);
+        setNewQDb(settingsData.new_q);
+        setAmendmentReasonDb(settingsData.amendment_reason || "");
+        setScrapOverrideDb(settingsData.scrap_override || {});
+
+        setPartsDb(partsData.map((p: any) => ({
+          id: p.id,
+          partNumber: p.part_number,
+          description: p.description,
+          plant: p.plant,
+          vendorCode: p.vendor_code || undefined,
+          alloy: p.alloy,
+          castWt: Number(p.cast_wt),
+          machiningWt: Number(p.machining_wt),
+          asCast: p.as_cast,
+          basePrice: Number(p.base_price),
+          baseQuarter: p.base_quarter,
+          poNum: p.po_num || undefined,
+          grnQty: Number(p.grn_qty || 0),
+        })));
+
+        const parsedRm: RmIndex = {};
+        for (const a of [...settingsData.alloys, "SCRAP"]) {
+          parsedRm[a] = {};
+          for (const q of settingsData.quarters) {
+            parsedRm[a][q] = null;
+          }
+        }
+        for (const item of rmData) {
+          if (!parsedRm[item.alloy]) parsedRm[item.alloy] = {};
+          parsedRm[item.alloy][item.quarter] = item.value != null ? Number(item.value) : null;
+        }
+        setRmDb(parsedRm);
+        setDbError(null);
+      } catch (err: any) {
+        console.error("Error loading data from Supabase:", err);
+        if (active) {
+          setDbError(err.message || String(err));
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadData();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Real-time updates subscription
+  useEffect(() => {
+    if (!isSupabaseConfigured || loading || dbError) return;
+
+    const partsChannel = supabase
+      .channel("parts-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "parts" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const p = payload.new;
+            const newPart: Part = {
+              id: p.id,
+              partNumber: p.part_number,
+              description: p.description,
+              plant: p.plant,
+              vendorCode: p.vendor_code || undefined,
+              alloy: p.alloy,
+              castWt: Number(p.cast_wt),
+              machiningWt: Number(p.machining_wt),
+              asCast: p.as_cast,
+              basePrice: Number(p.base_price),
+              baseQuarter: p.base_quarter,
+              poNum: p.po_num || undefined,
+              grnQty: Number(p.grn_qty || 0),
+            };
+            setPartsDb(prev => {
+              if (prev.some(x => x.id === newPart.id)) return prev;
+              return [...prev, newPart];
+            });
+          } else if (payload.eventType === "UPDATE") {
+            const p = payload.new;
+            const updated: Part = {
+              id: p.id,
+              partNumber: p.part_number,
+              description: p.description,
+              plant: p.plant,
+              vendorCode: p.vendor_code || undefined,
+              alloy: p.alloy,
+              castWt: Number(p.cast_wt),
+              machiningWt: Number(p.machining_wt),
+              asCast: p.as_cast,
+              basePrice: Number(p.base_price),
+              baseQuarter: p.base_quarter,
+              poNum: p.po_num || undefined,
+              grnQty: Number(p.grn_qty || 0),
+            };
+            setPartsDb(prev => prev.map(x => x.id === updated.id ? updated : x));
+          } else if (payload.eventType === "DELETE") {
+            const id = payload.old.id;
+            setPartsDb(prev => prev.filter(x => x.id !== id));
+          }
+        }
+      )
+      .subscribe();
+
+    const rmChannel = supabase
+      .channel("rm-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "rm_index" },
+        (payload) => {
+          if (payload.eventType === "INSERT" || payload.eventType === "UPDATE") {
+            const item = payload.new;
+            setRmDb(prev => {
+              const next = { ...prev };
+              if (!next[item.alloy]) next[item.alloy] = {};
+              next[item.alloy][item.quarter] = item.value != null ? Number(item.value) : null;
+              return next;
+            });
+          } else if (payload.eventType === "DELETE") {
+            const item = payload.old;
+            setRmDb(prev => {
+              const next = { ...prev };
+              if (next[item.alloy]) {
+                delete next[item.alloy][item.quarter];
+              }
+              return next;
+            });
+          }
+        }
+      )
+      .subscribe();
+
+    const settingsChannel = supabase
+      .channel("settings-realtime")
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "settings", filter: "id=eq.1" },
+        (payload) => {
+          const s = payload.new;
+          setQuartersDb(s.quarters);
+          setAlloysDb(s.alloys);
+          setPrevQDb(s.prev_q);
+          setNewQDb(s.new_q);
+          setAmendmentReasonDb(s.amendment_reason || "");
+          setScrapOverrideDb(s.scrap_override || {});
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(partsChannel);
+      supabase.removeChannel(rmChannel);
+      supabase.removeChannel(settingsChannel);
+    };
+  }, [loading, dbError]);
+
+  // Sync amendment reason to DB debounced
+  useEffect(() => {
+    if (!isSupabaseConfigured || loading || dbError) return;
+    const t = setTimeout(async () => {
+      const { data } = await supabase.from("settings").select("amendment_reason").eq("id", 1).single();
+      if (data && data.amendment_reason !== amendmentReason) {
+        await supabase.from("settings").update({ amendment_reason: amendmentReason }).eq("id", 1);
+      }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [amendmentReason, loading, dbError]);
+
+  // Derived GRN Qty from part states
+  const grnQty = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const p of parts) {
+      if (p.grnQty) map[p.id] = p.grnQty;
+    }
+    return map;
+  }, [parts]);
+
+  async function setGrnQty(next: Record<string, number>) {
+    if (!isSupabaseConfigured) {
+      setPartsRaw(prev => prev.map(p => {
+        const newVal = next[p.id] ?? 0;
+        return { ...p, grnQty: newVal };
+      }));
+      return;
+    }
+
+    for (const p of parts) {
+      const oldVal = p.grnQty ?? 0;
+      const newVal = next[p.id] ?? 0;
+      if (newVal !== oldVal) {
+        setPartsDb(prev => prev.map(x => x.id === p.id ? { ...x, grnQty: newVal } : x));
+        supabase.from("parts").update({ grn_qty: newVal }).eq("id", p.id).then(({ error }) => {
+          if (error) console.error("Error updating grnQty:", error);
+        });
+      }
+    }
+  }
+
+  async function updateSettings(patch: any) {
+    if (!isSupabaseConfigured) return;
+    const dbPatch: any = {};
+    if (patch.quarters !== undefined) dbPatch.quarters = patch.quarters;
+    if (patch.alloys !== undefined) dbPatch.alloys = patch.alloys;
+    if (patch.prevQ !== undefined) dbPatch.prev_q = patch.prevQ;
+    if (patch.newQ !== undefined) dbPatch.new_q = patch.newQ;
+    if (patch.amendmentReason !== undefined) dbPatch.amendment_reason = patch.amendmentReason;
+    if (patch.scrapOverride !== undefined) dbPatch.scrap_override = patch.scrapOverride;
+
+    const { error } = await supabase.from("settings").update(dbPatch).eq("id", 1);
+    if (error) console.error("Error updating settings:", error);
+  }
+
+  async function handleSetPrevQ(q: string) {
+    setPrevQ(q);
+    if (isSupabaseConfigured) {
+      await updateSettings({ prevQ: q });
+    }
+  }
+
+  async function handleSetNewQ(q: string) {
+    setNewQ(q);
+    if (isSupabaseConfigured) {
+      await updateSettings({ newQ: q });
+    }
+  }
 
   const rows = useMemo(() => calcAll(parts, rm, prevQ, newQ, quarters), [parts, rm, prevQ, newQ, quarters]);
   const history = useMemo(() => {
@@ -80,28 +446,38 @@ export default function Home() {
   const inconsistencies = useMemo(() => findInconsistencies(parts), [parts]);
   const badIds = useMemo(() => inconsistentIds(parts), [parts]);
 
-  // Auto-compute SCRAP for newQ column when SCM14 changes
   const autoScrap = useMemo(() => {
     return computeAutoScrap(rm, prevQ, newQ);
   }, [rm, prevQ, newQ]);
 
-  function updateRm(alloy: string, q: string, v: string) {
+  async function updateRm(alloy: string, q: string, v: string) {
+    const val = v === "" ? null : Number(v);
     const isScrapNewQ = alloy === "SCRAP" && q === newQ;
+    
+    setRm((prev) => ({ ...prev, [alloy]: { ...prev[alloy], [q]: val } }));
+    
+    let nextOverride = { ...scrapOverride };
     if (isScrapNewQ) {
-      // If user clears, re-enable auto; otherwise mark as override
-      if (v === "") {
-        setScrapOverride(prev => ({ ...prev, [`${q}`]: false }));
-      } else {
-        setScrapOverride(prev => ({ ...prev, [`${q}`]: true }));
+      const isOverride = v !== "";
+      nextOverride = { ...scrapOverride, [q]: isOverride };
+      setScrapOverride(nextOverride);
+    }
+
+    if (isSupabaseConfigured) {
+      const { error: rmErr } = await supabase
+        .from("rm_index")
+        .upsert({ alloy, quarter: q, value: val }, { onConflict: "alloy,quarter" });
+      if (rmErr) console.error("Error upserting RM index:", rmErr);
+
+      if (isScrapNewQ) {
+        await updateSettings({ scrapOverride: nextOverride });
       }
     }
-    setRm((prev) => ({ ...prev, [alloy]: { ...prev[alloy], [q]: v === "" ? null : Number(v) } }));
   }
 
-  // Apply auto-scrap to newQ if not overridden
   const effectiveRm = useMemo(() => {
     if (autoScrap == null || scrapOverride[newQ]) return rm;
-    if (rm["SCRAP"]?.[newQ] != null) return rm; // user has value
+    if (rm["SCRAP"]?.[newQ] != null) return rm;
     return {
       ...rm,
       SCRAP: { ...rm["SCRAP"], [newQ]: autoScrap },
@@ -115,24 +491,115 @@ export default function Home() {
     return out;
   }, [parts, effectiveRm, quarters]);
 
-  function updatePart(id: string, patch: Partial<Part>) {
+  async function updatePart(id: string, patch: Partial<Part>) {
     setParts((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+
+    if (isSupabaseConfigured) {
+      const dbPatch: any = {};
+      if (patch.partNumber !== undefined) dbPatch.part_number = patch.partNumber;
+      if (patch.description !== undefined) dbPatch.description = patch.description;
+      if (patch.plant !== undefined) dbPatch.plant = patch.plant;
+      if (patch.vendorCode !== undefined) dbPatch.vendor_code = patch.vendorCode;
+      if (patch.alloy !== undefined) dbPatch.alloy = patch.alloy;
+      if (patch.castWt !== undefined) dbPatch.cast_wt = patch.castWt;
+      if (patch.machiningWt !== undefined) dbPatch.machining_wt = patch.machiningWt;
+      if (patch.asCast !== undefined) dbPatch.as_cast = patch.asCast;
+      if (patch.basePrice !== undefined) dbPatch.base_price = patch.basePrice;
+      if (patch.baseQuarter !== undefined) dbPatch.base_quarter = patch.baseQuarter;
+      if (patch.poNum !== undefined) dbPatch.po_num = patch.poNum;
+      if (patch.grnQty !== undefined) dbPatch.grn_qty = patch.grnQty;
+
+      const { error } = await supabase.from("parts").update(dbPatch).eq("id", id);
+      if (error) console.error("Error updating part:", error);
+    }
   }
-  function addPart() {
-    setParts((p) => [...p, {
-      id: `p${Date.now()}`, partNumber: "", description: "", plant: "1020",
+
+  async function addPart() {
+    const newId = `p${Date.now()}`;
+    const newPart: Part = {
+      id: newId, partNumber: "", description: "", plant: "1020",
       vendorCode: "", alloy: alloys[0] ?? "SCM 14", castWt: 0, machiningWt: 0, asCast: false,
-      basePrice: 0, baseQuarter: prevQ, poNum: "",
-    }]);
+      basePrice: 0, baseQuarter: prevQ || quarters[0] || "", poNum: "", grnQty: 0,
+    };
+    
+    setParts((p) => [...p, newPart]);
+
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("parts").insert({
+        id: newPart.id,
+        part_number: newPart.partNumber,
+        description: newPart.description,
+        plant: newPart.plant,
+        vendor_code: newPart.vendorCode || null,
+        alloy: newPart.alloy,
+        cast_wt: newPart.castWt,
+        machining_wt: newPart.machiningWt,
+        as_cast: newPart.asCast,
+        base_price: newPart.basePrice,
+        base_quarter: newPart.baseQuarter,
+        po_num: newPart.poNum || null,
+        grn_qty: newPart.grnQty,
+      });
+      if (error) console.error("Error inserting part:", error);
+    }
   }
-  function removePart(id: string) { setParts((p) => p.filter((x) => x.id !== id)); }
+
+  async function removePart(id: string) {
+    setParts((p) => p.filter((x) => x.id !== id));
+
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("parts").delete().eq("id", id);
+      if (error) console.error("Error deleting part:", error);
+    }
+  }
 
   async function handlePartsUpload(file: File, mode: "append" | "replace") {
     const incoming = await parsePartsExcel(file, prevQ);
     setParts((prev) => (mode === "replace" ? incoming : [...prev, ...incoming]));
+
+    if (isSupabaseConfigured) {
+      if (mode === "replace") {
+        const { error: delErr } = await supabase.from("parts").delete().neq("id", "0");
+        if (delErr) console.error("Error clearing parts table:", delErr);
+      }
+      const dbParts = incoming.map(p => ({
+        id: p.id,
+        part_number: p.partNumber,
+        description: p.description,
+        plant: p.plant,
+        vendor_code: p.vendorCode || null,
+        alloy: p.alloy,
+        cast_wt: p.castWt,
+        machining_wt: p.machiningWt,
+        as_cast: p.asCast,
+        base_price: p.basePrice,
+        base_quarter: p.baseQuarter,
+        po_num: p.poNum || null,
+        grn_qty: p.grnQty ?? 0,
+      }));
+      const { error: insErr } = await supabase.from("parts").insert(dbParts);
+      if (insErr) console.error("Error uploading parts:", insErr);
+    }
   }
+
   async function handleRmUpload(file: File) {
     const incoming = await parseRmExcel(file);
+    
+    const newAlloyList = Object.keys(incoming).filter(k => k !== "SCRAP");
+    let nextAlloys = [...alloys];
+    if (newAlloyList.length > 0) {
+      for (const a of newAlloyList) if (!nextAlloys.includes(a)) nextAlloys.push(a);
+    }
+    const allQtrs = Object.values(incoming).flatMap(v => Object.keys(v ?? {}));
+    const uniqueQtrs = [...new Set(allQtrs)];
+    let nextQuarters = [...quarters];
+    if (uniqueQtrs.length > 0) {
+      for (const q of uniqueQtrs) if (!nextQuarters.includes(q)) nextQuarters.push(q);
+    }
+
+    setAlloys(nextAlloys);
+    setQuarters(nextQuarters);
+
     setRm((prev) => {
       const merged: RmIndex = { ...prev };
       for (const alloy of Object.keys(incoming)) {
@@ -140,30 +607,31 @@ export default function Home() {
       }
       return merged;
     });
-    // Also update alloys/quarters if new ones appeared
-    const newAlloyList = Object.keys(incoming).filter(k => k !== "SCRAP");
-    if (newAlloyList.length > 0) {
-      setAlloys(prev => {
-        const combined = [...prev];
-        for (const a of newAlloyList) if (!combined.includes(a)) combined.push(a);
-        return combined;
-      });
-    }
-    const allQtrs = Object.values(incoming).flatMap(v => Object.keys(v ?? {}));
-    const uniqueQtrs = [...new Set(allQtrs)];
-    if (uniqueQtrs.length > 0) {
-      setQuarters(prev => {
-        const combined = [...prev];
-        for (const q of uniqueQtrs) if (!combined.includes(q)) combined.push(q);
-        return combined;
-      });
+
+    if (isSupabaseConfigured) {
+      const toInsert: any[] = [];
+      for (const alloy of Object.keys(incoming)) {
+        for (const quarter of Object.keys(incoming[alloy])) {
+          toInsert.push({
+            alloy,
+            quarter,
+            value: incoming[alloy][quarter],
+          });
+        }
+      }
+      const { error: rmErr } = await supabase.from("rm_index").upsert(toInsert, { onConflict: "alloy,quarter" });
+      if (rmErr) console.error("Error upserting RM index from upload:", rmErr);
+
+      await updateSettings({ alloys: nextAlloys, quarters: nextQuarters });
     }
   }
 
   // Quarter management
-  function addQuarter(name: string) {
+  async function addQuarter(name: string) {
     if (!name || quarters.includes(name)) return;
-    setQuarters(prev => [...prev, name]);
+    const nextQtrs = [...quarters, name];
+    
+    setQuarters(nextQtrs);
     setRm(prev => {
       const next = { ...prev };
       for (const a of RM_ROWS) {
@@ -171,13 +639,23 @@ export default function Home() {
       }
       return next;
     });
+
+    if (isSupabaseConfigured) {
+      await updateSettings({ quarters: nextQtrs });
+      const toInsert = alloys.map(a => ({ alloy: a, quarter: name, value: null }));
+      toInsert.push({ alloy: "SCRAP", quarter: name, value: null });
+      await supabase.from("rm_index").insert(toInsert);
+    }
   }
-  function renameQuarter(oldName: string, newName: string) {
+
+  async function renameQuarter(oldName: string, newName: string) {
     if (!newName || newName === oldName || quarters.includes(newName)) return;
-    setQuarters(prev => prev.map(q => q === oldName ? newName : q));
-    // Update parts with this base quarter
+    const nextQtrs = quarters.map(q => q === oldName ? newName : q);
+    const nextPrev = prevQ === oldName ? newName : prevQ;
+    const nextNew = newQ === oldName ? newName : newQ;
+
+    setQuarters(nextQtrs);
     setParts(prev => prev.map(p => p.baseQuarter === oldName ? { ...p, baseQuarter: newName } : p));
-    // Rename in rm
     setRm(prev => {
       const next = { ...prev };
       for (const a of Object.keys(next)) {
@@ -188,12 +666,23 @@ export default function Home() {
       }
       return next;
     });
-    if (prevQ === oldName) setPrevQ(newName);
-    if (newQ === oldName) setNewQ(newName);
+    if (prevQ === oldName) handleSetPrevQ(newName);
+    if (newQ === oldName) handleSetNewQ(newName);
+
+    if (isSupabaseConfigured) {
+      await updateSettings({ quarters: nextQtrs, prevQ: nextPrev, newQ: nextNew });
+      await supabase.from("parts").update({ base_quarter: newName }).eq("base_quarter", oldName);
+      await supabase.from("rm_index").update({ quarter: newName }).eq("quarter", oldName);
+    }
   }
-  function removeQuarter(name: string) {
+
+  async function removeQuarter(name: string) {
     if (quarters.length <= 1) return;
-    setQuarters(prev => prev.filter(q => q !== name));
+    const nextQtrs = quarters.filter(q => q !== name);
+    const nextPrev = prevQ === name ? nextQtrs[0] || "" : prevQ;
+    const nextNew = newQ === name ? nextQtrs[0] || "" : newQ;
+
+    setQuarters(nextQtrs);
     setRm(prev => {
       const next = { ...prev };
       for (const a of Object.keys(next)) {
@@ -202,40 +691,122 @@ export default function Home() {
       }
       return next;
     });
-    if (prevQ === name) setPrevQ(quarters.find(q => q !== name) ?? "");
-    if (newQ === name) setNewQ(quarters.find(q => q !== name) ?? "");
+    if (prevQ === name) handleSetPrevQ(nextPrev);
+    if (newQ === name) handleSetNewQ(nextNew);
+
+    if (isSupabaseConfigured) {
+      await updateSettings({ quarters: nextQtrs, prevQ: nextPrev, newQ: nextNew });
+      await supabase.from("rm_index").delete().eq("quarter", name);
+    }
   }
 
   // Alloy management
-  function addAlloy(name: string) {
+  async function addAlloy(name: string) {
     if (!name || alloys.includes(name)) return;
-    setAlloys(prev => [...prev, name]);
+    const nextAlloys = [...alloys, name];
+
+    setAlloys(nextAlloys);
     setRm(prev => ({ ...prev, [name]: Object.fromEntries(quarters.map(q => [q, null])) }));
+
+    if (isSupabaseConfigured) {
+      await updateSettings({ alloys: nextAlloys });
+      const toInsert = quarters.map(q => ({ alloy: name, quarter: q, value: null }));
+      await supabase.from("rm_index").insert(toInsert);
+    }
   }
-  function renameAlloy(oldName: string, newName: string) {
+
+  async function renameAlloy(oldName: string, newName: string) {
     if (!newName || newName === oldName || alloys.includes(newName)) return;
-    setAlloys(prev => prev.map(a => a === oldName ? newName : a));
+    const nextAlloys = alloys.map(a => a === oldName ? newName : a);
+
+    setAlloys(nextAlloys);
     setParts(prev => prev.map(p => p.alloy === oldName ? { ...p, alloy: newName } : p));
     setRm(prev => {
       const next = { ...prev, [newName]: prev[oldName] ?? {} };
       delete next[oldName];
       return next;
     });
+
+    if (isSupabaseConfigured) {
+      await updateSettings({ alloys: nextAlloys });
+      await supabase.from("parts").update({ alloy: newName }).eq("alloy", oldName);
+      await supabase.from("rm_index").update({ alloy: newName }).eq("alloy", oldName);
+    }
   }
-  function removeAlloy(name: string) {
+
+  async function removeAlloy(name: string) {
     if (alloys.length <= 1) return;
-    setAlloys(prev => prev.filter(a => a !== name));
+    const nextAlloys = alloys.filter(a => a !== name);
+
+    setAlloys(nextAlloys);
     setRm(prev => {
       const next = { ...prev };
       delete next[name];
       return next;
     });
+
+    if (isSupabaseConfigured) {
+      await updateSettings({ alloys: nextAlloys });
+      await supabase.from("rm_index").delete().eq("alloy", name);
+    }
   }
 
   const displayRm = effectiveRm;
 
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center space-y-4">
+        <div className="rounded-md bg-primary text-primary-foreground p-3 animate-bounce">
+          <Factory className="size-8" />
+        </div>
+        <div className="text-sm font-semibold animate-pulse text-muted-foreground">Loading dashboard data from Supabase...</div>
+      </div>
+    );
+  }
+
+  if (dbError) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center p-6">
+        <Card className="max-w-md w-full border-destructive animate-in fade-in zoom-in-95 duration-200">
+          <CardHeader className="pb-3 flex flex-row items-center gap-3">
+            <div className="rounded-md bg-destructive/10 text-destructive p-2">
+              <AlertTriangle className="size-6" />
+            </div>
+            <div>
+              <CardTitle className="text-lg">Database Error</CardTitle>
+              <CardDescription>Could not load data from Supabase</CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="text-xs font-mono bg-destructive/5 text-destructive p-3 rounded border border-destructive/10 break-all">
+              {dbError}
+            </div>
+            <div className="text-xs text-muted-foreground space-y-2">
+              <p>Please check that:</p>
+              <ul className="list-disc list-inside">
+                <li>Your Supabase URL & Anon Key are set in your local environment.</li>
+                <li>Your database schemas have been pushed to the database.</li>
+              </ul>
+            </div>
+            <Button className="w-full" variant="outline" onClick={() => window.location.reload()}>
+              Retry Connection
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-background text-foreground">
+      {!isSupabaseConfigured && (
+        <div className="bg-amber-500/10 border-b border-amber-500/20 text-amber-600 px-4 py-2 text-center text-xs flex items-center justify-center gap-2">
+          <AlertTriangle className="size-4 shrink-0" />
+          <span>
+            <strong>Sandbox Mode:</strong> Supabase environment variables are missing. App is running with static in-memory data. Edits will not persist.
+          </span>
+        </div>
+      )}
       <header className="border-b bg-card sticky top-0 z-40">
         <div className="mx-auto max-w-[1700px] px-4 md:px-6 py-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -283,14 +854,14 @@ export default function Home() {
           <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="space-y-1.5">
               <Label>Previous Quarter (Old Price)</Label>
-              <Select value={prevQ} onValueChange={setPrevQ}>
+              <Select value={prevQ} onValueChange={handleSetPrevQ}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>{quarters.map((q) => <SelectItem key={q} value={q}>{q}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5">
               <Label>New Quarter</Label>
-              <Select value={newQ} onValueChange={setNewQ}>
+              <Select value={newQ} onValueChange={handleSetNewQ}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>{quarters.map((q) => <SelectItem key={q} value={q}>{q}</SelectItem>)}</SelectContent>
               </Select>
