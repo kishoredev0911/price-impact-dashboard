@@ -1,0 +1,9 @@
+node_modules
+**/node_modules
+.git
+.cache
+.local
+.expo
+coverage
+*.tsbuildinfo
+**/.tsbuildinfo
