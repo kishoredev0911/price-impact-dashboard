@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Download, Upload, FileSpreadsheet } from "lucide-react";
-import { cc, type CalcRow, type Part } from "@/lib/pricing";
+import { cc, type CalcRow, type POCalc } from "@/lib/pricing";
 import { downloadGrnTemplate, parseGrnExcel, grnKey } from "@/lib/excel";
 
 const inr = (n: number) =>
@@ -15,7 +15,7 @@ const lakhs = (n: number) => (n / 100000).toFixed(4);
 export function GrnTab({
   parts, rows, grnQty, setGrnQty, prevQ, newQ,
 }: {
-  parts: Part[]; rows: CalcRow[];
+  parts: POCalc[]; rows: CalcRow[];
   grnQty: Record<string, number>;
   setGrnQty: (next: Record<string, number>) => void;
   prevQ: string; newQ: string;

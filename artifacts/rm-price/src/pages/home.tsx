@@ -2,14 +2,17 @@ import { useMemo, useRef, useState, useEffect } from "react";
 import {
   calcAll, cc, computeHistory, deriveSeries, derivedScrapWt,
   findInconsistencies, inconsistentIds, isManualAsCast, computeAutoScrap,
-  type Part, type RmIndex,
+  type Part, type PO, type Vendor, type Material, type POCalc, type RmIndex,
 } from "@/lib/pricing";
 import { supabase } from "@/lib/supabase";
 import {
   downloadCalcExport, downloadHistoryExport, downloadPartsExport, downloadPartsTemplate,
-  downloadRmTemplate, parsePartsExcel, parseRmExcel,
+  downloadRmTemplate, downloadPOsExport, parsePartsExcel, parseRmExcel,
 } from "@/lib/excel";
-import { SEED_PARTS, SEED_RM_INDEX, DEFAULT_QUARTERS, DEFAULT_ALLOYS } from "@/lib/seed-data";
+import {
+  SEED_PARTS, SEED_POS, SEED_VENDORS, SEED_MATERIALS, SEED_RM_INDEX,
+  DEFAULT_QUARTERS, DEFAULT_ALLOYS,
+} from "@/lib/seed-data";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -30,6 +33,7 @@ import {
 import { LayoutDashboard, GitBranch, PackageCheck } from "lucide-react";
 import { DashboardTab } from "@/components/dashboard-tab";
 import { GrnTab } from "@/components/grn-tab";
+import { PriceTicker } from "@/components/price-ticker";
 
 function Th({ children, right }: { children?: React.ReactNode; right?: boolean }) {
   return <th className={`px-2 py-2 border ${right ? "text-right" : "text-left"} whitespace-nowrap`}>{children}</th>;
@@ -64,7 +68,12 @@ export default function Home() {
     }
     return init;
   });
+
   const [partsRaw, setPartsRaw] = useState<Part[]>(SEED_PARTS);
+  const [posRaw, setPosRaw] = useState<PO[]>(SEED_POS);
+  const [vendorsRaw, setVendorsRaw] = useState<Vendor[]>(SEED_VENDORS);
+  const [materialsRaw, setMaterialsRaw] = useState<Material[]>(SEED_MATERIALS);
+
   const [prevQRaw, setPrevQRaw] = useState<string>(DEFAULT_QUARTERS[0]);
   const [newQRaw, setNewQRaw] = useState<string>(DEFAULT_QUARTERS[1] ?? DEFAULT_QUARTERS[0]);
   const [amendmentReasonRaw, setAmendmentReasonRaw] = useState("");
@@ -77,7 +86,12 @@ export default function Home() {
   const [quartersDb, setQuartersDb] = useState<string[]>([]);
   const [alloysDb, setAlloysDb] = useState<string[]>([]);
   const [rmDb, setRmDb] = useState<RmIndex>({});
+
   const [partsDb, setPartsDb] = useState<Part[]>([]);
+  const [posDb, setPosDb] = useState<PO[]>([]);
+  const [vendorsDb, setVendorsDb] = useState<Vendor[]>([]);
+  const [materialsDb, setMaterialsDb] = useState<Material[]>([]);
+
   const [prevQDb, setPrevQDb] = useState<string>("");
   const [newQDb, setNewQDb] = useState<string>("");
   const [amendmentReasonDb, setAmendmentReasonDb] = useState("");
@@ -87,7 +101,12 @@ export default function Home() {
   const quarters = isSupabaseConfigured ? quartersDb : quartersRaw;
   const alloys = isSupabaseConfigured ? alloysDb : alloysRaw;
   const rm = isSupabaseConfigured ? rmDb : rmRaw;
-  const parts = isSupabaseConfigured ? partsDb : partsRaw;
+
+  const partsMaster = isSupabaseConfigured ? partsDb : partsRaw;
+  const posMaster = isSupabaseConfigured ? posDb : posRaw;
+  const vendorsMaster = isSupabaseConfigured ? vendorsDb : vendorsRaw;
+  const materialsMaster = isSupabaseConfigured ? materialsDb : materialsRaw;
+
   const prevQ = isSupabaseConfigured ? prevQDb : prevQRaw;
   const newQ = isSupabaseConfigured ? newQDb : newQRaw;
   const amendmentReason = isSupabaseConfigured ? amendmentReasonDb : amendmentReasonRaw;
@@ -97,11 +116,31 @@ export default function Home() {
   const setQuarters = isSupabaseConfigured ? setQuartersDb : setQuartersRaw;
   const setAlloys = isSupabaseConfigured ? setAlloysDb : setAlloysRaw;
   const setRm = isSupabaseConfigured ? setRmDb : setRmRaw;
-  const setParts = isSupabaseConfigured ? setPartsDb : setPartsRaw;
+
+  const setPartsMaster = isSupabaseConfigured ? setPartsDb : setPartsRaw;
+  const setPosMaster = isSupabaseConfigured ? setPosDb : setPosRaw;
+  const setVendorsMaster = isSupabaseConfigured ? setVendorsDb : setVendorsRaw;
+  const setMaterialsMaster = isSupabaseConfigured ? setMaterialsDb : setMaterialsRaw;
+
   const setPrevQ = isSupabaseConfigured ? setPrevQDb : setPrevQRaw;
   const setNewQ = isSupabaseConfigured ? setNewQDb : setNewQRaw;
   const setAmendmentReason = isSupabaseConfigured ? setAmendmentReasonDb : setAmendmentReasonRaw;
   const setScrapOverride = isSupabaseConfigured ? setScrapOverrideDb : setScrapOverrideRaw;
+
+  // Derive combined PO + physical Part fields (acts as virtual parts list for downstream calculations)
+  const parts = useMemo<POCalc[]>(() => {
+    return posMaster.map((po) => {
+      const part = partsMaster.find((p) => p.partNumber === po.partNumber);
+      return {
+        ...po,
+        description: part?.description ?? "Unknown Part",
+        alloy: part?.alloy ?? "SCM 14",
+        castWt: part?.castWt ?? 0,
+        machiningWt: part?.machiningWt ?? 0,
+        asCast: part?.asCast ?? false,
+      };
+    });
+  }, [posMaster, partsMaster]);
 
   const RM_ROWS = useMemo(() => [...alloys, "SCRAP"], [alloys]);
 
@@ -113,6 +152,7 @@ export default function Home() {
     async function loadData() {
       try {
         setLoading(true);
+
         // 1. Fetch settings
         let { data: settingsData, error: settingsErr } = await supabase
           .from("settings")
@@ -142,39 +182,82 @@ export default function Home() {
           throw settingsErr;
         }
 
-        // 2. Fetch parts
+        // 2. Fetch materials
+        let { data: materialsData, error: materialsErr } = await supabase
+          .from("materials")
+          .select("*");
+        if (materialsErr) throw materialsErr;
+        if (!materialsData || materialsData.length === 0) {
+          const { data: seeded, error: seedErr } = await supabase
+            .from("materials")
+            .insert(SEED_MATERIALS)
+            .select();
+          if (seedErr) throw seedErr;
+          materialsData = seeded;
+        }
+
+        // 3. Fetch vendors
+        let { data: vendorsData, error: vendorsErr } = await supabase
+          .from("vendors")
+          .select("*");
+        if (vendorsErr) throw vendorsErr;
+        if (!vendorsData || vendorsData.length === 0) {
+          const { data: seeded, error: seedErr } = await supabase
+            .from("vendors")
+            .insert(SEED_VENDORS.map(v => ({ vendor_code: v.vendorCode, name: v.name })))
+            .select();
+          if (seedErr) throw seedErr;
+          vendorsData = seeded;
+        }
+
+        // 4. Fetch parts
         let { data: partsData, error: partsErr } = await supabase
           .from("parts")
           .select("*")
           .order("created_at", { ascending: true });
-
         if (partsErr) throw partsErr;
-
         if (!partsData || partsData.length === 0) {
-          const { data: seededParts, error: seedPartsErr } = await supabase
+          const { data: seeded, error: seedErr } = await supabase
             .from("parts")
             .insert(SEED_PARTS.map(p => ({
               id: p.id,
               part_number: p.partNumber,
               description: p.description,
-              plant: p.plant,
-              vendor_code: p.vendorCode || null,
               alloy: p.alloy,
               cast_wt: p.castWt,
               machining_wt: p.machiningWt,
               as_cast: p.asCast,
-              base_price: p.basePrice,
-              base_quarter: p.baseQuarter,
-              po_num: p.poNum || null,
-              grn_qty: p.grnQty ?? 0,
             })))
             .select();
-
-          if (seedPartsErr) throw seedPartsErr;
-          partsData = seededParts;
+          if (seedErr) throw seedErr;
+          partsData = seeded;
         }
 
-        // 3. Fetch RM index
+        // 5. Fetch POs
+        let { data: posData, error: posErr } = await supabase
+          .from("pos")
+          .select("*")
+          .order("created_at", { ascending: true });
+        if (posErr) throw posErr;
+        if (!posData || posData.length === 0) {
+          const { data: seeded, error: seedErr } = await supabase
+            .from("pos")
+            .insert(SEED_POS.map(po => ({
+              id: po.id,
+              po_num: po.poNum,
+              part_number: po.partNumber,
+              vendor_code: po.vendorCode,
+              plant: po.plant,
+              base_price: po.basePrice,
+              base_quarter: po.baseQuarter,
+              grn_qty: po.grnQty,
+            })))
+            .select();
+          if (seedErr) throw seedErr;
+          posData = seeded;
+        }
+
+        // 6. Fetch RM index
         let { data: rmData, error: rmErr } = await supabase
           .from("rm_index")
           .select("*");
@@ -210,20 +293,36 @@ export default function Home() {
         setAmendmentReasonDb(settingsData.amendment_reason || "");
         setScrapOverrideDb(settingsData.scrap_override || {});
 
+        setMaterialsDb(materialsData.map((m: any) => ({
+          alloy: m.alloy,
+          category: m.category,
+          description: m.description,
+        })));
+
+        setVendorsDb(vendorsData.map((v: any) => ({
+          vendorCode: v.vendor_code,
+          name: v.name,
+        })));
+
         setPartsDb(partsData.map((p: any) => ({
           id: p.id,
           partNumber: p.part_number,
           description: p.description,
-          plant: p.plant,
-          vendorCode: p.vendor_code || undefined,
           alloy: p.alloy,
           castWt: Number(p.cast_wt),
           machiningWt: Number(p.machining_wt),
           asCast: p.as_cast,
-          basePrice: Number(p.base_price),
-          baseQuarter: p.base_quarter,
-          poNum: p.po_num || undefined,
-          grnQty: Number(p.grn_qty || 0),
+        })));
+
+        setPosDb(posData.map((po: any) => ({
+          id: po.id,
+          poNum: po.po_num,
+          partNumber: po.part_number,
+          vendorCode: po.vendor_code,
+          plant: po.plant,
+          basePrice: Number(po.base_price),
+          baseQuarter: po.base_quarter,
+          grnQty: Number(po.grn_qty || 0),
         })));
 
         const parsedRm: RmIndex = {};
@@ -262,6 +361,52 @@ export default function Home() {
   useEffect(() => {
     if (!isSupabaseConfigured || loading || dbError) return;
 
+    const materialsChannel = supabase
+      .channel("materials-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "materials" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const m = payload.new;
+            setMaterialsDb(prev => {
+              if (prev.some(x => x.alloy === m.alloy)) return prev;
+              return [...prev, { alloy: m.alloy, category: m.category, description: m.description }];
+            });
+          } else if (payload.eventType === "UPDATE") {
+            const m = payload.new;
+            setMaterialsDb(prev => prev.map(x => x.alloy === m.alloy ? { alloy: m.alloy, category: m.category, description: m.description } : x));
+          } else if (payload.eventType === "DELETE") {
+            const alloy = payload.old.alloy;
+            setMaterialsDb(prev => prev.filter(x => x.alloy !== alloy));
+          }
+        }
+      )
+      .subscribe();
+
+    const vendorsChannel = supabase
+      .channel("vendors-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "vendors" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const v = payload.new;
+            setVendorsDb(prev => {
+              if (prev.some(x => x.vendorCode === v.vendor_code)) return prev;
+              return [...prev, { vendorCode: v.vendor_code, name: v.name }];
+            });
+          } else if (payload.eventType === "UPDATE") {
+            const v = payload.new;
+            setVendorsDb(prev => prev.map(x => x.vendorCode === v.vendor_code ? { vendorCode: v.vendor_code, name: v.name } : x));
+          } else if (payload.eventType === "DELETE") {
+            const vendorCode = payload.old.vendor_code;
+            setVendorsDb(prev => prev.filter(x => x.vendorCode !== vendorCode));
+          }
+        }
+      )
+      .subscribe();
+
     const partsChannel = supabase
       .channel("parts-realtime")
       .on(
@@ -274,16 +419,10 @@ export default function Home() {
               id: p.id,
               partNumber: p.part_number,
               description: p.description,
-              plant: p.plant,
-              vendorCode: p.vendor_code || undefined,
               alloy: p.alloy,
               castWt: Number(p.cast_wt),
               machiningWt: Number(p.machining_wt),
               asCast: p.as_cast,
-              basePrice: Number(p.base_price),
-              baseQuarter: p.base_quarter,
-              poNum: p.po_num || undefined,
-              grnQty: Number(p.grn_qty || 0),
             };
             setPartsDb(prev => {
               if (prev.some(x => x.id === newPart.id)) return prev;
@@ -295,21 +434,58 @@ export default function Home() {
               id: p.id,
               partNumber: p.part_number,
               description: p.description,
-              plant: p.plant,
-              vendorCode: p.vendor_code || undefined,
               alloy: p.alloy,
               castWt: Number(p.cast_wt),
               machiningWt: Number(p.machining_wt),
               asCast: p.as_cast,
-              basePrice: Number(p.base_price),
-              baseQuarter: p.base_quarter,
-              poNum: p.po_num || undefined,
-              grnQty: Number(p.grn_qty || 0),
             };
             setPartsDb(prev => prev.map(x => x.id === updated.id ? updated : x));
           } else if (payload.eventType === "DELETE") {
             const id = payload.old.id;
             setPartsDb(prev => prev.filter(x => x.id !== id));
+          }
+        }
+      )
+      .subscribe();
+
+    const posChannel = supabase
+      .channel("pos-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "pos" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const po = payload.new;
+            const newPO: PO = {
+              id: po.id,
+              poNum: po.po_num,
+              partNumber: po.part_number,
+              vendorCode: po.vendor_code,
+              plant: po.plant,
+              basePrice: Number(po.base_price),
+              baseQuarter: po.base_quarter,
+              grnQty: Number(po.grn_qty || 0),
+            };
+            setPosDb(prev => {
+              if (prev.some(x => x.id === newPO.id)) return prev;
+              return [...prev, newPO];
+            });
+          } else if (payload.eventType === "UPDATE") {
+            const po = payload.new;
+            const updated: PO = {
+              id: po.id,
+              poNum: po.po_num,
+              partNumber: po.part_number,
+              vendorCode: po.vendor_code,
+              plant: po.plant,
+              basePrice: Number(po.base_price),
+              baseQuarter: po.base_quarter,
+              grnQty: Number(po.grn_qty || 0),
+            };
+            setPosDb(prev => prev.map(x => x.id === updated.id ? updated : x));
+          } else if (payload.eventType === "DELETE") {
+            const id = payload.old.id;
+            setPosDb(prev => prev.filter(x => x.id !== id));
           }
         }
       )
@@ -361,7 +537,10 @@ export default function Home() {
       .subscribe();
 
     return () => {
+      supabase.removeChannel(materialsChannel);
+      supabase.removeChannel(vendorsChannel);
       supabase.removeChannel(partsChannel);
+      supabase.removeChannel(posChannel);
       supabase.removeChannel(rmChannel);
       supabase.removeChannel(settingsChannel);
     };
@@ -379,7 +558,7 @@ export default function Home() {
     return () => clearTimeout(t);
   }, [amendmentReason, loading, dbError]);
 
-  // Derived GRN Qty from part states
+  // Derived GRN Qty from virtual parts (POCalc[])
   const grnQty = useMemo(() => {
     const map: Record<string, number> = {};
     for (const p of parts) {
@@ -390,19 +569,21 @@ export default function Home() {
 
   async function setGrnQty(next: Record<string, number>) {
     if (!isSupabaseConfigured) {
-      setPartsRaw(prev => prev.map(p => {
-        const newVal = next[p.id] ?? 0;
-        return { ...p, grnQty: newVal };
-      }));
+      setPosRaw((prev) =>
+        prev.map((po) => {
+          const newVal = next[po.id] ?? 0;
+          return { ...po, grnQty: newVal };
+        })
+      );
       return;
     }
 
-    for (const p of parts) {
-      const oldVal = p.grnQty ?? 0;
-      const newVal = next[p.id] ?? 0;
+    for (const po of posMaster) {
+      const oldVal = po.grnQty ?? 0;
+      const newVal = next[po.id] ?? 0;
       if (newVal !== oldVal) {
-        setPartsDb(prev => prev.map(x => x.id === p.id ? { ...x, grnQty: newVal } : x));
-        supabase.from("parts").update({ grn_qty: newVal }).eq("id", p.id).then(({ error }) => {
+        setPosDb((prev) => prev.map((x) => (x.id === po.id ? { ...x, grnQty: newVal } : x)));
+        supabase.from("pos").update({ grn_qty: newVal }).eq("id", po.id).then(({ error }) => {
           if (error) console.error("Error updating grnQty:", error);
         });
       }
@@ -437,12 +618,6 @@ export default function Home() {
     }
   }
 
-  const rows = useMemo(() => calcAll(parts, rm, prevQ, newQ, quarters), [parts, rm, prevQ, newQ, quarters]);
-  const history = useMemo(() => {
-    const out: Record<string, Record<string, number | null>> = {};
-    for (const p of parts) out[p.id] = computeHistory(p, rm, quarters);
-    return out;
-  }, [parts, rm, quarters]);
   const inconsistencies = useMemo(() => findInconsistencies(parts), [parts]);
   const badIds = useMemo(() => inconsistentIds(parts), [parts]);
 
@@ -453,9 +628,9 @@ export default function Home() {
   async function updateRm(alloy: string, q: string, v: string) {
     const val = v === "" ? null : Number(v);
     const isScrapNewQ = alloy === "SCRAP" && q === newQ;
-    
+
     setRm((prev) => ({ ...prev, [alloy]: { ...prev[alloy], [q]: val } }));
-    
+
     let nextOverride = { ...scrapOverride };
     if (isScrapNewQ) {
       const isOverride = v !== "";
@@ -491,100 +666,251 @@ export default function Home() {
     return out;
   }, [parts, effectiveRm, quarters]);
 
-  async function updatePart(id: string, patch: Partial<Part>) {
-    setParts((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  // ─── Material Master CRUD ─────────────────────────────────────────
+  async function addMaterial() {
+    const newMaterial: Material = { alloy: `ALLOY-${Date.now().toString(36).toUpperCase()}`, category: "Aluminium Casting", description: "" };
+    setMaterialsMaster((prev) => [...prev, newMaterial]);
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("materials").insert(newMaterial);
+      if (error) console.error("Error inserting material:", error);
+    }
+  }
 
+  async function updateMaterial(alloy: string, patch: Partial<Material>) {
+    setMaterialsMaster((prev) => prev.map((m) => (m.alloy === alloy ? { ...m, ...patch } : m)));
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("materials").update(patch).eq("alloy", alloy);
+      if (error) console.error("Error updating material:", error);
+    }
+  }
+
+  async function removeMaterial(alloy: string) {
+    setMaterialsMaster((prev) => prev.filter((m) => m.alloy !== alloy));
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("materials").delete().eq("alloy", alloy);
+      if (error) console.error("Error deleting material:", error);
+    }
+  }
+
+  // ─── Vendor Master CRUD ───────────────────────────────────────────
+  async function addVendor() {
+    const newVendor: Vendor = { vendorCode: `V-${Date.now()}`, name: "New Vendor" };
+    setVendorsMaster((prev) => [...prev, newVendor]);
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("vendors").insert({ vendor_code: newVendor.vendorCode, name: newVendor.name });
+      if (error) console.error("Error inserting vendor:", error);
+    }
+  }
+
+  async function updateVendor(vendorCode: string, patch: Partial<Vendor>) {
+    setVendorsMaster((prev) => prev.map((v) => (v.vendorCode === vendorCode ? { ...v, ...patch } : v)));
+    if (isSupabaseConfigured) {
+      const dbPatch: any = {};
+      if (patch.name !== undefined) dbPatch.name = patch.name;
+      const { error } = await supabase.from("vendors").update(dbPatch).eq("vendor_code", vendorCode);
+      if (error) console.error("Error updating vendor:", error);
+    }
+  }
+
+  async function removeVendor(vendorCode: string) {
+    setVendorsMaster((prev) => prev.filter((v) => v.vendorCode !== vendorCode));
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("vendors").delete().eq("vendor_code", vendorCode);
+      if (error) console.error("Error deleting vendor:", error);
+    }
+  }
+
+  // ─── Part Master CRUD ─────────────────────────────────────────────
+  async function addPart() {
+    const newId = `p${Date.now()}`;
+    const newPart: Part = {
+      id: newId, partNumber: `PN-${Date.now()}`, description: "", alloy: alloys[0] ?? "SCM 14", castWt: 0, machiningWt: 0, asCast: false
+    };
+    setPartsMaster((prev) => [...prev, newPart]);
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("parts").insert({
+        id: newPart.id,
+        part_number: newPart.partNumber,
+        description: newPart.description,
+        alloy: newPart.alloy,
+        cast_wt: newPart.castWt,
+        machining_wt: newPart.machiningWt,
+        as_cast: newPart.asCast,
+      });
+      if (error) console.error("Error inserting part:", error);
+    }
+  }
+
+  async function updatePart(id: string, patch: Partial<Part>) {
+    setPartsMaster((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
     if (isSupabaseConfigured) {
       const dbPatch: any = {};
       if (patch.partNumber !== undefined) dbPatch.part_number = patch.partNumber;
       if (patch.description !== undefined) dbPatch.description = patch.description;
-      if (patch.plant !== undefined) dbPatch.plant = patch.plant;
-      if (patch.vendorCode !== undefined) dbPatch.vendor_code = patch.vendorCode;
       if (patch.alloy !== undefined) dbPatch.alloy = patch.alloy;
       if (patch.castWt !== undefined) dbPatch.cast_wt = patch.castWt;
       if (patch.machiningWt !== undefined) dbPatch.machining_wt = patch.machiningWt;
       if (patch.asCast !== undefined) dbPatch.as_cast = patch.asCast;
-      if (patch.basePrice !== undefined) dbPatch.base_price = patch.basePrice;
-      if (patch.baseQuarter !== undefined) dbPatch.base_quarter = patch.baseQuarter;
-      if (patch.poNum !== undefined) dbPatch.po_num = patch.poNum;
-      if (patch.grnQty !== undefined) dbPatch.grn_qty = patch.grnQty;
 
       const { error } = await supabase.from("parts").update(dbPatch).eq("id", id);
       if (error) console.error("Error updating part:", error);
     }
   }
 
-  async function addPart() {
-    const newId = `p${Date.now()}`;
-    const newPart: Part = {
-      id: newId, partNumber: "", description: "", plant: "1020",
-      vendorCode: "", alloy: alloys[0] ?? "SCM 14", castWt: 0, machiningWt: 0, asCast: false,
-      basePrice: 0, baseQuarter: prevQ || quarters[0] || "", poNum: "", grnQty: 0,
-    };
-    
-    setParts((p) => [...p, newPart]);
-
-    if (isSupabaseConfigured) {
-      const { error } = await supabase.from("parts").insert({
-        id: newPart.id,
-        part_number: newPart.partNumber,
-        description: newPart.description,
-        plant: newPart.plant,
-        vendor_code: newPart.vendorCode || null,
-        alloy: newPart.alloy,
-        cast_wt: newPart.castWt,
-        machining_wt: newPart.machiningWt,
-        as_cast: newPart.asCast,
-        base_price: newPart.basePrice,
-        base_quarter: newPart.baseQuarter,
-        po_num: newPart.poNum || null,
-        grn_qty: newPart.grnQty,
-      });
-      if (error) console.error("Error inserting part:", error);
-    }
-  }
-
   async function removePart(id: string) {
-    setParts((p) => p.filter((x) => x.id !== id));
-
+    setPartsMaster((prev) => prev.filter((p) => p.id !== id));
     if (isSupabaseConfigured) {
       const { error } = await supabase.from("parts").delete().eq("id", id);
       if (error) console.error("Error deleting part:", error);
     }
   }
 
+  // ─── PO Master CRUD ───────────────────────────────────────────────
+  async function addPO() {
+    const newId = `po${Date.now()}`;
+    const firstPart = partsMaster[0]?.partNumber ?? "";
+    const firstVendor = vendorsMaster[0]?.vendorCode ?? "";
+    const newPO: PO = {
+      id: newId, poNum: `PO-${Date.now()}`, partNumber: firstPart, vendorCode: firstVendor, plant: "1020", basePrice: 0, baseQuarter: prevQ || quarters[0] || "", grnQty: 0
+    };
+    setPosMaster((prev) => [...prev, newPO]);
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("pos").insert({
+        id: newPO.id,
+        po_num: newPO.poNum,
+        part_number: newPO.partNumber,
+        vendor_code: newPO.vendorCode,
+        plant: newPO.plant,
+        base_price: newPO.basePrice,
+        base_quarter: newPO.baseQuarter,
+        grn_qty: newPO.grnQty,
+      });
+      if (error) console.error("Error inserting PO:", error);
+    }
+  }
+
+  async function updatePO(id: string, patch: Partial<PO>) {
+    setPosMaster((prev) => prev.map((po) => (po.id === id ? { ...po, ...patch } : po)));
+    if (isSupabaseConfigured) {
+      const dbPatch: any = {};
+      if (patch.poNum !== undefined) dbPatch.po_num = patch.poNum;
+      if (patch.partNumber !== undefined) dbPatch.part_number = patch.partNumber;
+      if (patch.vendorCode !== undefined) dbPatch.vendor_code = patch.vendorCode;
+      if (patch.plant !== undefined) dbPatch.plant = patch.plant;
+      if (patch.basePrice !== undefined) dbPatch.base_price = patch.basePrice;
+      if (patch.baseQuarter !== undefined) dbPatch.base_quarter = patch.baseQuarter;
+      if (patch.grnQty !== undefined) dbPatch.grn_qty = patch.grnQty;
+
+      const { error } = await supabase.from("pos").update(dbPatch).eq("id", id);
+      if (error) console.error("Error updating PO:", error);
+    }
+  }
+
+  async function removePO(id: string) {
+    setPosMaster((prev) => prev.filter((po) => po.id !== id));
+    if (isSupabaseConfigured) {
+      const { error } = await supabase.from("pos").delete().eq("id", id);
+      if (error) console.error("Error deleting PO:", error);
+    }
+  }
+
   async function handlePartsUpload(file: File, mode: "append" | "replace") {
     const incoming = await parsePartsExcel(file, prevQ);
-    setParts((prev) => (mode === "replace" ? incoming : [...prev, ...incoming]));
+
+    const newMaterials: Material[] = [];
+    const newVendors: Vendor[] = [];
+    const newParts: Part[] = [];
+    const newPOs: PO[] = [];
+
+    const materialMap = new Set(materialsMaster.map(m => m.alloy));
+    const vendorMap = new Set(vendorsMaster.map(v => v.vendorCode));
+    const partMap = new Set(partsMaster.map(p => p.partNumber));
+
+    incoming.forEach((row, i) => {
+      if (row.alloy && !materialMap.has(row.alloy) && !newMaterials.some(m => m.alloy === row.alloy)) {
+        newMaterials.push({ alloy: row.alloy, category: "Aluminium Casting", description: `${row.alloy} alloy` });
+      }
+      if (row.vendorCode && !vendorMap.has(row.vendorCode) && !newVendors.some(v => v.vendorCode === row.vendorCode)) {
+        newVendors.push({ vendorCode: row.vendorCode, name: `Vendor ${row.vendorCode}` });
+      }
+      if (row.partNumber && !partMap.has(row.partNumber) && !newParts.some(p => p.partNumber === row.partNumber)) {
+        newParts.push({
+          id: `p-${row.partNumber}`,
+          partNumber: row.partNumber,
+          description: row.description,
+          alloy: row.alloy,
+          castWt: row.castWt,
+          machiningWt: row.machiningWt,
+          asCast: row.asCast,
+        });
+      }
+      newPOs.push({
+        id: row.id,
+        poNum: row.poNum || `PO-${Date.now()}-${i}`,
+        partNumber: row.partNumber,
+        vendorCode: row.vendorCode,
+        plant: row.plant,
+        basePrice: row.basePrice,
+        baseQuarter: row.baseQuarter,
+        grnQty: row.grnQty,
+      });
+    });
+
+    if (mode === "replace") {
+      setMaterialsMaster(newMaterials);
+      setVendorsMaster(newVendors);
+      setPartsMaster(newParts);
+      setPosMaster(newPOs);
+    } else {
+      setMaterialsMaster(prev => [...prev, ...newMaterials]);
+      setVendorsMaster(prev => [...prev, ...newVendors]);
+      setPartsMaster(prev => [...prev, ...newParts]);
+      setPosMaster(prev => [...prev, ...newPOs]);
+    }
 
     if (isSupabaseConfigured) {
       if (mode === "replace") {
-        const { error: delErr } = await supabase.from("parts").delete().neq("id", "0");
-        if (delErr) console.error("Error clearing parts table:", delErr);
+        await supabase.from("pos").delete().neq("id", "0");
+        await supabase.from("parts").delete().neq("id", "0");
+        await supabase.from("vendors").delete().neq("vendor_code", "0");
+        await supabase.from("materials").delete().neq("alloy", "0");
       }
-      const dbParts = incoming.map(p => ({
-        id: p.id,
-        part_number: p.partNumber,
-        description: p.description,
-        plant: p.plant,
-        vendor_code: p.vendorCode || null,
-        alloy: p.alloy,
-        cast_wt: p.castWt,
-        machining_wt: p.machiningWt,
-        as_cast: p.asCast,
-        base_price: p.basePrice,
-        base_quarter: p.baseQuarter,
-        po_num: p.poNum || null,
-        grn_qty: p.grnQty ?? 0,
-      }));
-      const { error: insErr } = await supabase.from("parts").insert(dbParts);
-      if (insErr) console.error("Error uploading parts:", insErr);
+
+      if (newMaterials.length > 0) {
+        await supabase.from("materials").insert(newMaterials);
+      }
+      if (newVendors.length > 0) {
+        await supabase.from("vendors").insert(newVendors.map(v => ({ vendor_code: v.vendorCode, name: v.name })));
+      }
+      if (newParts.length > 0) {
+        await supabase.from("parts").insert(newParts.map(p => ({
+          id: p.id,
+          part_number: p.partNumber,
+          description: p.description,
+          alloy: p.alloy,
+          cast_wt: p.castWt,
+          machining_wt: p.machiningWt,
+          as_cast: p.asCast,
+        })));
+      }
+      if (newPOs.length > 0) {
+        await supabase.from("pos").insert(newPOs.map(po => ({
+          id: po.id,
+          po_num: po.poNum,
+          part_number: po.partNumber,
+          vendor_code: po.vendorCode,
+          plant: po.plant,
+          base_price: po.basePrice,
+          base_quarter: po.baseQuarter,
+          grn_qty: po.grnQty,
+        })));
+      }
     }
   }
 
   async function handleRmUpload(file: File) {
     const incoming = await parseRmExcel(file);
-    
+
     const newAlloyList = Object.keys(incoming).filter(k => k !== "SCRAP");
     let nextAlloys = [...alloys];
     if (newAlloyList.length > 0) {
@@ -630,7 +956,7 @@ export default function Home() {
   async function addQuarter(name: string) {
     if (!name || quarters.includes(name)) return;
     const nextQtrs = [...quarters, name];
-    
+
     setQuarters(nextQtrs);
     setRm(prev => {
       const next = { ...prev };
@@ -655,7 +981,7 @@ export default function Home() {
     const nextNew = newQ === oldName ? newName : newQ;
 
     setQuarters(nextQtrs);
-    setParts(prev => prev.map(p => p.baseQuarter === oldName ? { ...p, baseQuarter: newName } : p));
+    setPosMaster(prev => prev.map(po => po.baseQuarter === oldName ? { ...po, baseQuarter: newName } : po));
     setRm(prev => {
       const next = { ...prev };
       for (const a of Object.keys(next)) {
@@ -671,7 +997,7 @@ export default function Home() {
 
     if (isSupabaseConfigured) {
       await updateSettings({ quarters: nextQtrs, prevQ: nextPrev, newQ: nextNew });
-      await supabase.from("parts").update({ base_quarter: newName }).eq("base_quarter", oldName);
+      await supabase.from("pos").update({ base_quarter: newName }).eq("base_quarter", oldName);
       await supabase.from("rm_index").update({ quarter: newName }).eq("quarter", oldName);
     }
   }
@@ -720,7 +1046,7 @@ export default function Home() {
     const nextAlloys = alloys.map(a => a === oldName ? newName : a);
 
     setAlloys(nextAlloys);
-    setParts(prev => prev.map(p => p.alloy === oldName ? { ...p, alloy: newName } : p));
+    setPartsMaster(prev => prev.map(p => p.alloy === oldName ? { ...p, alloy: newName } : p));
     setRm(prev => {
       const next = { ...prev, [newName]: prev[oldName] ?? {} };
       delete next[oldName];
@@ -807,6 +1133,7 @@ export default function Home() {
           </span>
         </div>
       )}
+      <PriceTicker alloys={alloys} rm={effectiveRm} quarters={quarters} />
       <header className="border-b bg-card sticky top-0 z-40">
         <div className="mx-auto max-w-[1700px] px-4 md:px-6 py-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -819,7 +1146,8 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Badge variant="secondary">{parts.length} parts</Badge>
+            <Badge variant="secondary">{parts.length} PO rows</Badge>
+            <Badge variant="secondary">{partsMaster.length} parts</Badge>
             <Badge variant="secondary">{alloys.length} alloys</Badge>
             <Badge variant="secondary">{quarters.length} qtrs</Badge>
           </div>
@@ -909,7 +1237,10 @@ export default function Home() {
             <TabsTrigger value="deriv"><GitBranch className="size-4 mr-1.5" />Derivation</TabsTrigger>
             <TabsTrigger value="history"><History className="size-4 mr-1.5" />Price History</TabsTrigger>
             <TabsTrigger value="grn"><PackageCheck className="size-4 mr-1.5" />GRN Impact</TabsTrigger>
-            <TabsTrigger value="parts">Part Master ({parts.length})</TabsTrigger>
+            <TabsTrigger value="parts">Part Master ({partsMaster.length})</TabsTrigger>
+            <TabsTrigger value="pos">PO Master ({posMaster.length})</TabsTrigger>
+            <TabsTrigger value="vendors">Vendor Master ({vendorsMaster.length})</TabsTrigger>
+            <TabsTrigger value="materials">Material Master ({materialsMaster.length})</TabsTrigger>
             <TabsTrigger value="rm"><Settings className="size-4 mr-1.5" />RM Index</TabsTrigger>
           </TabsList>
 
@@ -988,7 +1319,7 @@ export default function Home() {
               <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0 flex-wrap gap-2">
                 <div>
                   <CardTitle className="text-base">Price History — all parts × all quarters</CardTitle>
-                  <CardDescription>Chain-computed from each part's base quarter using the RM Index.</CardDescription>
+                  <CardDescription>Chain-computed from each PO's base quarter using the RM Index.</CardDescription>
                 </div>
                 <Button size="sm" onClick={() => downloadHistoryExport(parts, effectiveHistory, quarters)}>
                   <Download className="size-4 mr-1.5" />Export Excel
@@ -1042,14 +1373,14 @@ export default function Home() {
                 <div>
                   <CardTitle className="text-base">Part Master</CardTitle>
                   <CardDescription>
-                    Parts ending in <b>0</b> or <b>6</b> are forced AS CAST (no scrap deduction).
+                    Physical component properties. Parts ending in <b>0</b> or <b>6</b> are forced AS CAST.
                   </CardDescription>
                 </div>
                 <div className="flex gap-2 flex-wrap">
                   <Button size="sm" variant="outline" onClick={downloadPartsTemplate}>
                     <FileSpreadsheet className="size-4 mr-1.5" />Template
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => downloadPartsExport(parts)}>
+                  <Button size="sm" variant="outline" onClick={() => downloadPartsExport(partsMaster)}>
                     <Download className="size-4 mr-1.5" />Export
                   </Button>
                   <UploadButton label="Append" accept=".xlsx,.xls" onFile={(f) => handlePartsUpload(f, "append")} />
@@ -1061,32 +1392,27 @@ export default function Home() {
                 <table className="w-full text-xs border-collapse">
                   <thead className="bg-muted text-muted-foreground">
                     <tr className="text-left">
-                      <Th>Part #</Th><Th>Description</Th><Th>Plant</Th><Th>Vendor</Th>
-                      <Th>PO Num</Th><Th>Alloy</Th>
+                      <Th>Part #</Th><Th>Description</Th><Th>Alloy</Th>
                       <Th right>Cast Wt</Th><Th right>Mach Wt</Th><Th right>Scrap Wt</Th>
-                      <Th>AS CAST</Th><Th right>SAP Price</Th><Th>Base Q</Th><Th></Th>
+                      <Th>AS CAST</Th><Th></Th>
                     </tr>
                   </thead>
                   <tbody>
-                    {parts.map((p) => {
+                    {partsMaster.map((p) => {
                       const manual = isManualAsCast(p);
                       const auto06 = /[06]$/.test(p.partNumber);
-                      const bad = badIds.has(p.id);
                       return (
-                        <tr key={p.id} className={`border-t ${bad ? "bg-red-100/70" : manual ? "bg-amber-100/70" : ""}`}>
-                          <Td><Input className="h-7 font-mono w-28" value={p.partNumber} onChange={(e) => updatePart(p.id, { partNumber: e.target.value })} /></Td>
-                          <Td><Input className="h-7 w-40" value={p.description} onChange={(e) => updatePart(p.id, { description: e.target.value })} /></Td>
-                          <Td><Input className="h-7 w-16" value={p.plant} onChange={(e) => updatePart(p.id, { plant: e.target.value })} /></Td>
-                          <Td><Input className="h-7 w-20" value={p.vendorCode ?? ""} onChange={(e) => updatePart(p.id, { vendorCode: e.target.value })} /></Td>
-                          <Td><Input className="h-7 w-20" value={p.poNum ?? ""} onChange={(e) => updatePart(p.id, { poNum: e.target.value })} /></Td>
+                        <tr key={p.id} className={`border-t ${manual ? "bg-amber-100/70" : ""}`}>
+                          <Td><Input className="h-7 font-mono w-40" value={p.partNumber} onChange={(e) => updatePart(p.id, { partNumber: e.target.value })} /></Td>
+                          <Td><Input className="h-7 w-64" value={p.description} onChange={(e) => updatePart(p.id, { description: e.target.value })} /></Td>
                           <Td>
                             <Select value={p.alloy} onValueChange={(v) => updatePart(p.id, { alloy: v })}>
-                              <SelectTrigger className="h-7 w-28"><SelectValue /></SelectTrigger>
+                              <SelectTrigger className="h-7 w-32"><SelectValue /></SelectTrigger>
                               <SelectContent>{alloys.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
                             </Select>
                           </Td>
-                          <Td right><Input className="h-7 w-20 text-right" type="number" step="0.001" value={p.castWt} onChange={(e) => updatePart(p.id, { castWt: Number(e.target.value) })} /></Td>
-                          <Td right><Input className="h-7 w-20 text-right" type="number" step="0.001" value={p.machiningWt} onChange={(e) => updatePart(p.id, { machiningWt: Number(e.target.value) })} /></Td>
+                          <Td right><Input className="h-7 w-24 text-right" type="number" step="0.001" value={p.castWt} onChange={(e) => updatePart(p.id, { castWt: Number(e.target.value) })} /></Td>
+                          <Td right><Input className="h-7 w-24 text-right" type="number" step="0.001" value={p.machiningWt} onChange={(e) => updatePart(p.id, { machiningWt: Number(e.target.value) })} /></Td>
                           <Td right className="tabular-nums text-muted-foreground">{derivedScrapWt(p).toFixed(3)}</Td>
                           <Td>
                             <div className="flex items-center gap-1.5">
@@ -1099,13 +1425,6 @@ export default function Home() {
                               {manual && <AlertTriangle className="size-3.5 text-amber-700" />}
                             </div>
                           </Td>
-                          <Td right><Input className="h-7 w-24 text-right" type="number" step="0.01" value={p.basePrice} onChange={(e) => updatePart(p.id, { basePrice: Number(e.target.value) })} /></Td>
-                          <Td>
-                            <Select value={p.baseQuarter} onValueChange={(v) => updatePart(p.id, { baseQuarter: v })}>
-                              <SelectTrigger className="h-7 w-28"><SelectValue /></SelectTrigger>
-                              <SelectContent>{quarters.map((q) => <SelectItem key={q} value={q}>{q}</SelectItem>)}</SelectContent>
-                            </Select>
-                          </Td>
                           <Td>
                             <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => removePart(p.id)}>
                               <Trash2 className="size-3.5 text-destructive" />
@@ -1114,6 +1433,155 @@ export default function Home() {
                         </tr>
                       );
                     })}
+                  </tbody>
+                </table>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* PO MASTER */}
+          <TabsContent value="pos" className="mt-4">
+            <Card>
+              <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0 flex-wrap gap-2">
+                <div>
+                  <CardTitle className="text-base">PO Master</CardTitle>
+                  <CardDescription>
+                    Purchase Orders mapping parts to plants, vendors, base pricing, and quarters.
+                  </CardDescription>
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  <Button size="sm" variant="outline" onClick={() => downloadPOsExport(posMaster)}>
+                    <Download className="size-4 mr-1.5" />Export POs
+                  </Button>
+                  <Button onClick={addPO} size="sm"><Plus className="size-4 mr-1.5" />Add PO</Button>
+                </div>
+              </CardHeader>
+              <CardContent className="overflow-x-auto">
+                <table className="w-full text-xs border-collapse">
+                  <thead className="bg-muted text-muted-foreground">
+                    <tr className="text-left">
+                      <Th>PO Num</Th><Th>Part Number</Th><Th>Vendor Code</Th><Th>Plant</Th>
+                      <Th right>SAP Price (₹)</Th><Th>Base Quarter</Th><Th right>GRN Qty</Th><Th></Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {posMaster.map((po) => {
+                      const bad = badIds.has(po.id);
+                      return (
+                        <tr key={po.id} className={`border-t ${bad ? "bg-red-100/70" : ""}`}>
+                          <Td><Input className="h-7 font-mono w-28" value={po.poNum} onChange={(e) => updatePO(po.id, { poNum: e.target.value })} /></Td>
+                          <Td>
+                            <Select value={po.partNumber} onValueChange={(v) => updatePO(po.id, { partNumber: v })}>
+                              <SelectTrigger className="h-7 w-40 font-mono"><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                {partsMaster.map((p) => (
+                                  <SelectItem key={p.id} value={p.partNumber}>{p.partNumber} ({p.description.slice(0, 15)})</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </Td>
+                          <Td>
+                            <Select value={po.vendorCode} onValueChange={(v) => updatePO(po.id, { vendorCode: v })}>
+                              <SelectTrigger className="h-7 w-32 font-mono"><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                {vendorsMaster.map((v) => (
+                                  <SelectItem key={v.vendorCode} value={v.vendorCode}>{v.vendorCode} — {v.name.slice(0, 15)}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </Td>
+                          <Td><Input className="h-7 w-16" value={po.plant} onChange={(e) => updatePO(po.id, { plant: e.target.value })} /></Td>
+                          <Td right><Input className="h-7 w-24 text-right" type="number" step="0.01" value={po.basePrice} onChange={(e) => updatePO(po.id, { basePrice: Number(e.target.value) })} /></Td>
+                          <Td>
+                            <Select value={po.baseQuarter} onValueChange={(v) => updatePO(po.id, { baseQuarter: v })}>
+                              <SelectTrigger className="h-7 w-28"><SelectValue /></SelectTrigger>
+                              <SelectContent>{quarters.map((q) => <SelectItem key={q} value={q}>{q}</SelectItem>)}</SelectContent>
+                            </Select>
+                          </Td>
+                          <Td right><Input className="h-7 w-20 text-right" type="number" step="1" value={po.grnQty} onChange={(e) => updatePO(po.id, { grnQty: Number(e.target.value) })} /></Td>
+                          <Td>
+                            <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => removePO(po.id)}>
+                              <Trash2 className="size-3.5 text-destructive" />
+                            </Button>
+                          </Td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* VENDOR MASTER */}
+          <TabsContent value="vendors" className="mt-4">
+            <Card>
+              <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0 flex-wrap gap-2">
+                <div>
+                  <CardTitle className="text-base">Vendor Master</CardTitle>
+                  <CardDescription>
+                    Registered component suppliers.
+                  </CardDescription>
+                </div>
+                <Button onClick={addVendor} size="sm"><Plus className="size-4 mr-1.5" />Add Vendor</Button>
+              </CardHeader>
+              <CardContent className="max-w-md overflow-x-auto">
+                <table className="w-full text-xs border-collapse">
+                  <thead className="bg-muted text-muted-foreground">
+                    <tr className="text-left">
+                      <Th>Vendor Code</Th><Th>Vendor Name</Th><Th></Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vendorsMaster.map((v) => (
+                      <tr key={v.vendorCode} className="border-t">
+                        <Td className="font-mono">{v.vendorCode}</Td>
+                        <Td><Input className="h-7 w-48" value={v.name} onChange={(e) => updateVendor(v.vendorCode, { name: e.target.value })} /></Td>
+                        <Td>
+                          <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => removeVendor(v.vendorCode)}>
+                            <Trash2 className="size-3.5 text-destructive" />
+                          </Button>
+                        </Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* MATERIAL MASTER */}
+          <TabsContent value="materials" className="mt-4">
+            <Card>
+              <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0 flex-wrap gap-2">
+                <div>
+                  <CardTitle className="text-base">Material Master</CardTitle>
+                  <CardDescription>
+                    Alloy index configurations.
+                  </CardDescription>
+                </div>
+                <Button onClick={addMaterial} size="sm"><Plus className="size-4 mr-1.5" />Add Material</Button>
+              </CardHeader>
+              <CardContent className="max-w-xl overflow-x-auto">
+                <table className="w-full text-xs border-collapse">
+                  <thead className="bg-muted text-muted-foreground">
+                    <tr className="text-left">
+                      <Th>Alloy Grade</Th><Th>Category</Th><Th>Description</Th><Th></Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {materialsMaster.map((m) => (
+                      <tr key={m.alloy} className="border-t">
+                        <Td className="font-semibold">{m.alloy}</Td>
+                        <Td><Input className="h-7 w-40" value={m.category} onChange={(e) => updateMaterial(m.alloy, { category: e.target.value })} /></Td>
+                        <Td><Input className="h-7 w-48" value={m.description} onChange={(e) => updateMaterial(m.alloy, { description: e.target.value })} /></Td>
+                        <Td>
+                          <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => removeMaterial(m.alloy)}>
+                            <Trash2 className="size-3.5 text-destructive" />
+                          </Button>
+                        </Td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </CardContent>
@@ -1241,7 +1709,7 @@ export default function Home() {
 
 // ─── Derivation Tab ───────────────────────────────────────────────────────────
 function DerivationTab({ parts, rm, grnQty, quarters }: {
-  parts: Part[]; rm: RmIndex; grnQty: Record<string, number>; quarters: string[];
+  parts: POCalc[]; rm: RmIndex; grnQty: Record<string, number>; quarters: string[];
 }) {
   const [selectedId, setSelectedId] = useState(parts[0]?.id ?? "");
   const part = parts.find((p) => p.id === selectedId);
@@ -1256,11 +1724,11 @@ function DerivationTab({ parts, rm, grnQty, quarters }: {
         </CardHeader>
         <CardContent className="space-y-3">
           <Select value={selectedId} onValueChange={setSelectedId}>
-            <SelectTrigger className="w-full max-w-md"><SelectValue placeholder="Select a part" /></SelectTrigger>
+            <SelectTrigger className="w-full max-w-md"><SelectValue placeholder="Select a part/PO" /></SelectTrigger>
             <SelectContent>
               {parts.map((p) => (
                 <SelectItem key={p.id} value={p.id}>
-                  {p.partNumber} — {p.description} (Plant {p.plant})
+                  {p.poNum} — {p.partNumber} ({p.description.slice(0, 15)}) — Plant {p.plant}
                 </SelectItem>
               ))}
             </SelectContent>

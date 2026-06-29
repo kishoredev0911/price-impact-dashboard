@@ -1,23 +1,59 @@
 export type RmIndex = Record<string, Record<string, number | null>>;
 
+export interface Material {
+  alloy: string;
+  category: string;
+  description: string;
+}
+
+export interface Vendor {
+  vendorCode: string;
+  name: string;
+}
+
 export interface Part {
   id: string;
   partNumber: string;
   description: string;
-  plant: string;
-  vendorCode?: string;
   alloy: string;
   castWt: number;
   machiningWt: number;
   asCast: boolean;
+}
+
+export interface PO {
+  id: string;
+  poNum: string;
+  partNumber: string;
+  vendorCode: string;
+  plant: string;
   basePrice: number;
   baseQuarter: string;
-  poNum?: string;
-  grnQty?: number;
+  grnQty: number;
+}
+
+// Combined interface representing a PO line with physical Part properties merged in.
+// This matches the properties used in pricing calculations and the main dashboard.
+export interface POCalc {
+  id: string; // PO ID
+  poNum: string;
+  partNumber: string;
+  vendorCode: string;
+  plant: string;
+  basePrice: number;
+  baseQuarter: string;
+  grnQty: number;
+
+  // Merged physical properties from Part Master
+  description: string;
+  alloy: string;
+  castWt: number;
+  machiningWt: number;
+  asCast: boolean;
 }
 
 export interface CalcRow {
-  part: Part;
+  part: POCalc;
   oldPrice: number | null;
   prevBase: number | null;
   newBase: number | null;
@@ -36,19 +72,19 @@ export function endsIn0or6(pn: string) {
   const s = String(pn).trim();
   return s.endsWith("0") || s.endsWith("6");
 }
-export function cc(p: Pick<Part, "plant" | "partNumber">) {
+export function cc(p: Pick<POCalc, "plant" | "partNumber">) {
   return `${p.plant ?? ""}${p.partNumber ?? ""}`;
 }
-export function isAsCast(p: Part) { return endsIn0or6(p.partNumber) || p.asCast; }
-export function isManualAsCast(p: Part) { return p.asCast && !endsIn0or6(p.partNumber); }
-export function derivedScrapWt(p: Part): number {
+export function isAsCast(p: { partNumber: string; asCast: boolean }) { return endsIn0or6(p.partNumber) || p.asCast; }
+export function isManualAsCast(p: { partNumber: string; asCast: boolean }) { return p.asCast && !endsIn0or6(p.partNumber); }
+export function derivedScrapWt(p: { castWt: number; machiningWt: number }): number {
   return Math.max(+(p.castWt - p.machiningWt).toFixed(4), 0);
 }
-export function effectiveScrapWt(p: Part): number {
+export function effectiveScrapWt(p: { partNumber: string; asCast: boolean; castWt: number; machiningWt: number }): number {
   return isAsCast(p) ? 0 : derivedScrapWt(p);
 }
 
-function stepCalc(oldPrice: number, p: Part, rm: RmIndex, prevQ: string, newQ: string): CalcRow {
+function stepCalc(oldPrice: number, p: POCalc, rm: RmIndex, prevQ: string, newQ: string): CalcRow {
   const prevBase = rm[p.alloy]?.[prevQ] ?? null;
   const newBase  = rm[p.alloy]?.[newQ]  ?? null;
   const prevScrap = rm["SCRAP"]?.[prevQ] ?? null;
@@ -87,7 +123,7 @@ function stepCalc(oldPrice: number, p: Part, rm: RmIndex, prevQ: string, newQ: s
   };
 }
 
-export function calcPart(p: Part, rm: RmIndex, prevQ: string, newQ: string, allQuarters: string[]): CalcRow {
+export function calcPart(p: POCalc, rm: RmIndex, prevQ: string, newQ: string, allQuarters: string[]): CalcRow {
   const baseIdx = allQuarters.indexOf(p.baseQuarter);
   const prevIdx = allQuarters.indexOf(prevQ);
   if (baseIdx < 0 || prevIdx < 0) return stepCalc(p.basePrice, p, rm, prevQ, newQ);
@@ -110,7 +146,7 @@ export function calcPart(p: Part, rm: RmIndex, prevQ: string, newQ: string, allQ
   return stepCalc(oldPrice, p, rm, prevQ, newQ);
 }
 
-export function calcAll(parts: Part[], rm: RmIndex, prevQ: string, newQ: string, allQuarters: string[]): CalcRow[] {
+export function calcAll(parts: POCalc[], rm: RmIndex, prevQ: string, newQ: string, allQuarters: string[]): CalcRow[] {
   return parts.map((p) => calcPart(p, rm, prevQ, newQ, allQuarters));
 }
 
@@ -124,7 +160,7 @@ export interface DerivStep {
   newPrice: number | null; note?: string;
 }
 
-export function deriveSeries(p: Part, rm: RmIndex, allQuarters: string[]): DerivStep[] {
+export function deriveSeries(p: POCalc, rm: RmIndex, allQuarters: string[]): DerivStep[] {
   const out: DerivStep[] = [];
   const baseIdx = allQuarters.indexOf(p.baseQuarter);
   if (baseIdx < 0) return out;
@@ -145,7 +181,7 @@ export function deriveSeries(p: Part, rm: RmIndex, allQuarters: string[]): Deriv
   return out;
 }
 
-export function computeHistory(p: Part, rm: RmIndex, allQuarters: string[]): Record<string, number | null> {
+export function computeHistory(p: POCalc, rm: RmIndex, allQuarters: string[]): Record<string, number | null> {
   const out: Record<string, number | null> = {};
   const baseIdx = allQuarters.indexOf(p.baseQuarter);
   if (baseIdx < 0) return out;
@@ -166,8 +202,8 @@ export interface PartInconsistency {
   values: Array<{ value: string | number; ids: string[] }>;
 }
 
-export function findInconsistencies(parts: Part[]): PartInconsistency[] {
-  const groups = new Map<string, Part[]>();
+export function findInconsistencies(parts: POCalc[]): PartInconsistency[] {
+  const groups = new Map<string, POCalc[]>();
   for (const p of parts) {
     if (!p.partNumber) continue;
     const arr = groups.get(p.partNumber) ?? [];
@@ -195,7 +231,7 @@ export function findInconsistencies(parts: Part[]): PartInconsistency[] {
   return out;
 }
 
-export function inconsistentIds(parts: Part[]): Set<string> {
+export function inconsistentIds(parts: POCalc[]): Set<string> {
   const set = new Set<string>();
   for (const inc of findInconsistencies(parts)) {
     for (const v of inc.values) for (const id of v.ids) set.add(id);

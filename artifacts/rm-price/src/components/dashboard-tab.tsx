@@ -6,7 +6,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { TrendingUp, Boxes, AlertTriangle, Trophy, Layers } from "lucide-react";
-import { type CalcRow, type Part, type RmIndex } from "@/lib/pricing";
+import { type CalcRow, type POCalc, type RmIndex } from "@/lib/pricing";
 
 const COLORS = ["#6366f1", "#f59e0b", "#10b981", "#ef4444", "#0ea5e9", "#a855f7", "#f97316", "#14b8a6"];
 
@@ -18,7 +18,7 @@ const lakhs = (n: number) => (n / 100000).toFixed(2);
 export function DashboardTab({
   parts, rm, rows, prevQ, newQ, grnQty, alloys,
 }: {
-  parts: Part[];
+  parts: POCalc[];
   rm: RmIndex;
   rows: CalcRow[];
   prevQ: string;
