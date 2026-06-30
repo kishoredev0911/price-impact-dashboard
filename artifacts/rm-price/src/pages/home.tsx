@@ -182,33 +182,30 @@ export default function Home() {
           throw settingsErr;
         }
 
-        // 2. Fetch materials
+        // 2. Fetch materials — always upsert seed rows so FK deps are satisfied
+        const { error: matUpsertErr } = await supabase
+          .from("materials")
+          .upsert(SEED_MATERIALS, { onConflict: "alloy", ignoreDuplicates: true });
+        if (matUpsertErr) throw matUpsertErr;
+
         let { data: materialsData, error: materialsErr } = await supabase
           .from("materials")
           .select("*");
         if (materialsErr) throw materialsErr;
-        if (!materialsData || materialsData.length === 0) {
-          const { data: seeded, error: seedErr } = await supabase
-            .from("materials")
-            .insert(SEED_MATERIALS)
-            .select();
-          if (seedErr) throw seedErr;
-          materialsData = seeded;
-        }
 
-        // 3. Fetch vendors
+        // 3. Fetch vendors — always upsert seed rows so FK deps are satisfied
+        const { error: vendorUpsertErr } = await supabase
+          .from("vendors")
+          .upsert(
+            SEED_VENDORS.map(v => ({ vendor_code: v.vendorCode, name: v.name })),
+            { onConflict: "vendor_code", ignoreDuplicates: true }
+          );
+        if (vendorUpsertErr) throw vendorUpsertErr;
+
         let { data: vendorsData, error: vendorsErr } = await supabase
           .from("vendors")
           .select("*");
         if (vendorsErr) throw vendorsErr;
-        if (!vendorsData || vendorsData.length === 0) {
-          const { data: seeded, error: seedErr } = await supabase
-            .from("vendors")
-            .insert(SEED_VENDORS.map(v => ({ vendor_code: v.vendorCode, name: v.name })))
-            .select();
-          if (seedErr) throw seedErr;
-          vendorsData = seeded;
-        }
 
         // 4. Fetch parts
         let { data: partsData, error: partsErr } = await supabase

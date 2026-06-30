@@ -68,6 +68,41 @@ export interface CalcRow {
   note?: string;
 }
 
+/**
+ * A premium rule mapping a derived alloy to a base alloy + fixed offset.
+ * e.g. { alloy: "SCM 14", baseAlloy: "ADC12", premium: 8 }
+ * → SCM 14 rate = ADC12 rate + 8
+ */
+export interface PremiumConfig {
+  alloy: string;      // derived alloy name (must match alloy in RmIndex)
+  baseAlloy: string;  // reference base alloy key (e.g. "LM6", "ADC12")
+  premium: number;    // positive = add, negative = subtract
+}
+
+/**
+ * Given the raw RmIndex (which contains base alloy rates entered manually)
+ * and a list of premium configs, returns a new RmIndex where derived alloy
+ * rates are auto-computed as: rate = baseAlloy[quarter] + premium.
+ *
+ * Manual alloys (no premium rule) keep their existing values.
+ * Base alloys (LM6, ADC12) keep their entered values as-is.
+ */
+export function applyPremiums(rm: RmIndex, premiums: PremiumConfig[]): RmIndex {
+  if (!premiums.length) return rm;
+  const result: RmIndex = { ...rm };
+  for (const { alloy, baseAlloy, premium } of premiums) {
+    const baseQuarterMap = rm[baseAlloy];
+    if (!baseQuarterMap) continue;
+    const derived: Record<string, number | null> = {};
+    for (const [q, baseVal] of Object.entries(baseQuarterMap)) {
+      derived[q] = baseVal != null ? +(baseVal + premium).toFixed(4) : null;
+    }
+    // Preserve any existing keys not in base alloy (e.g. historical manual entries)
+    result[alloy] = { ...(result[alloy] ?? {}), ...derived };
+  }
+  return result;
+}
+
 export function endsIn0or6(pn: string) {
   const s = String(pn).trim();
   return s.endsWith("0") || s.endsWith("6");
